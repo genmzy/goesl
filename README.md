@@ -7,7 +7,7 @@
 Installation can be done as usual:
 
 ```
-$ go get github.com/genmzy/eslgo
+$ go get github.com/genmzy/goesl
 ```
 
 **How it works**
