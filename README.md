@@ -25,12 +25,9 @@ go conn.HandleEvents(ctx, /* ... other params ... */)
 // when time to quit:
 if timeToQuit { // triggered should quit
 	log.Println("exiting...")
-	conn.Send(ctx, func(e *Event, err error) {
-		if err != nil {
-			log.Fatal(err)
-		}
-	}, "...")
 	cancel()
+	// close twice is allowed
+	conn.Close()
 }
 ```
 
