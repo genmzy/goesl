@@ -8,7 +8,6 @@ import (
 	"bufio"
 	"bytes"
 	"fmt"
-	"io"
 	"net/textproto"
 	"net/url"
 	"strconv"
@@ -16,9 +15,29 @@ import (
 	"time"
 )
 
-type MIMEMap struct {
+type mimeMap struct {
 	Map       textproto.MIMEHeader
 	IsEscaped bool
+}
+
+func (m mimeMap) get(key string) string {
+	val := m.Map.Get(key)
+	if m.IsEscaped {
+		val, _ = url.QueryUnescape(val)
+	}
+	return val
+}
+
+func (m mimeMap) String() string {
+	var s string
+	for k, v := range m.Map {
+		val := strings.Join(v, ",")
+		if m.IsEscaped {
+			val, _ = url.QueryUnescape(val)
+		}
+		s += fmt.Sprintf("%s: %s\n", k, val)
+	}
+	return s[:len(s)-1] // remove final newline
 }
 
 type FireTime uint64
@@ -34,9 +53,10 @@ type Event struct {
 	AppData string
 	Fire    FireTime
 	Type    EventType
-	Header  MIMEMap
-	Body    MIMEMap
-	RawBody []byte
+
+	header  mimeMap
+	body    mimeMap
+	rawBody []byte
 }
 
 type EventType int
@@ -148,60 +168,12 @@ const (
 	ALL
 )
 
-func NewEventFromReader(r *bufio.Reader) (*Event, error) {
-	var err error
-	e := &Event{}
-
-	e.Header.Map, err = textproto.NewReader(r).ReadMIMEHeader()
-	if err != nil {
-		return nil, &Error{
-			Original: err,
-			Stack:    "new event from socket: read mime header",
-		}
-	}
-
-	if slen := e.Get("Content-Length"); slen != "" {
-		len, err := strconv.Atoi(slen)
-		if err != nil {
-			return nil, fmt.Errorf("convert content-length %s: %v", slen, err)
-		}
-		e.RawBody = make([]byte, len)
-		_, err = io.ReadFull(r, e.RawBody)
-		if err != nil {
-			return nil, fmt.Errorf("read body: %v", err)
-		}
-	}
-
-	switch t := e.Get("Content-Type"); t {
-	case "auth/request":
-		e.Type = EventAuth
-	case "command/reply":
-		e.Type = EventCommandReply
-		reply := e.Get("Reply-Text")
-		if strings.Contains(reply, "%") {
-			e.Header.IsEscaped = true
-		}
-	case "text/event-plain":
-		e.Type = EventGeneric
-		err = e.parseTextBody()
-	case "text/event-json", "text/event-xml":
-		err = fmt.Errorf("unsupported format %s", t)
-	case "text/disconnect-notice", "text/rude-rejection":
-		e.Type = EventDisconnect
-	case "api/response":
-		e.Type = EventApiResponse
-	default:
-		e.Type = EventInvalid
-	}
-	return e, err
-}
-
 func (e *Event) GetTextBody() string {
 	if e.Type == EventApiResponse {
-		resp := strings.TrimSpace(string(e.RawBody))
+		resp := strings.TrimSpace(string(e.rawBody))
 		return string(resp)
 	}
-	slen := e.Body.Get("Content-Length")
+	slen := e.body.get("Content-Length")
 	if slen == "" {
 		return ""
 	}
@@ -209,52 +181,32 @@ func (e *Event) GetTextBody() string {
 	if err != nil {
 		return ""
 	}
-	blen := len(e.RawBody)
-	return string(e.RawBody[blen-bblen : blen-1])
+	blen := len(e.rawBody)
+	return string(e.rawBody[blen-bblen : blen-1])
 }
 
 // Get retrieves the value of header from Event header or (if not found) from Event body.
 // The value is returned unescaped and is empty if not found anywhere.
 func (e Event) Get(header string) string {
-	val := e.Header.Get(header)
+	val := e.header.get(header)
 	if val == "" {
-		val = e.Body.Get(header)
+		val = e.body.get(header)
 	}
 	return val
 }
 
 func (e Event) String() string {
-	body, _ := url.QueryUnescape(string(e.RawBody))
-	return fmt.Sprintf("%s\n.\n%s====================\n", e.Header, body)
-}
-
-func (m MIMEMap) Get(key string) string {
-	val := m.Map.Get(key)
-	if m.IsEscaped {
-		val, _ = url.QueryUnescape(val)
-	}
-	return val
-}
-
-func (m MIMEMap) String() string {
-	var s string
-	for k, v := range m.Map {
-		val := strings.Join(v, ",")
-		if m.IsEscaped {
-			val, _ = url.QueryUnescape(val)
-		}
-		s += fmt.Sprintf("%s: %s\n", k, val)
-	}
-	return s[:len(s)-1] // remove final newline
+	body, _ := url.QueryUnescape(string(e.rawBody))
+	return fmt.Sprintf("%s\n.\n%s====================\n", e.header, body)
 }
 
 func (e *Event) parseTextBody() error {
 	var err error
-	buf := bufio.NewReader(bytes.NewReader(e.RawBody))
-	if e.Body.Map, err = textproto.NewReader(buf).ReadMIMEHeader(); err != nil {
+	buf := bufio.NewReader(bytes.NewReader(e.rawBody))
+	if e.body.Map, err = textproto.NewReader(buf).ReadMIMEHeader(); err != nil {
 		return fmt.Errorf("parse text body: %v", err)
 	}
-	e.Body.IsEscaped = true
+	e.body.IsEscaped = true
 	e.UId = e.Get("Unique-ID")
 	e.Name, _ = EventNameString(e.Get("Event-Name"))
 	e.App = e.Get("Application")

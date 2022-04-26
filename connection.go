@@ -8,10 +8,16 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
-	"log"
+	"io"
 	"net"
+	"net/textproto"
+	"os"
+	"strconv"
 	"strings"
+	"sync"
+	"syscall"
 	"time"
 
 	"github.com/google/uuid"
@@ -25,80 +31,198 @@ type ConnHandler interface {
 }
 
 type Connection struct {
-	socket     net.Conn
-	buffer     *bufio.ReadWriter
-	cmdReply   chan *Event
-	apiResp    chan *Event
-	Handler    ConnHandler
-	Address    string
-	Password   string
-	Connected  bool
-	MaxRetries int
-	Timeout    time.Duration
-	UserData   interface{}
+	// replaced when reset
+	c         net.Conn
+	waitings  []time.Duration //  all old waitings
+	closeOnce *sync.Once      //  use pointer so that can be reset
+	connected bool
+	buffer    *bufio.ReadWriter
 
-	senderCancel    func()
-	sendRepHandlers chan sendRepHandler
+	opts *Options
 
-	logger EslLogger
+	cmdReply chan *Event
+	apiResp  chan *Event
+	Handler  ConnHandler
+	Address  string
+	Password string
+
+	srWg     sync.WaitGroup
+	srCancel func()
+	srTicker *time.Ticker
+	// channel between send-reply and handle-events
+	cmdReplyHandlers chan cmdReplyHandler
+}
+
+func (conn *Connection) dialTimes(retry bool) (err error) {
+	if !retry {
+		conn.c, err = net.DialTimeout("tcp", conn.Address, conn.opts.dialTimeout)
+		return err
+	}
+	for i := 0; i <= conn.opts.maxRetries || conn.opts.maxRetries < 0; i++ {
+		next := conn.opts.nextDialWait(conn.waitings)
+		conn.waitings = append(conn.waitings, next)
+		if len(conn.waitings) >= 2 {
+			sleep := conn.waitings[len(conn.waitings)-2]
+			conn.opts.logger.Warnf("connect failed, will retry in %v", sleep)
+			time.Sleep(sleep)
+		}
+		conn.opts.logger.Debugf("start dial with timeout: %s", conn.opts.dialTimeout)
+		conn.c, err = net.DialTimeout("tcp", conn.Address, conn.opts.dialTimeout)
+		if err == nil {
+			conn.waitings = conn.waitings[:0]
+			break
+		}
+	}
+	return
+}
+
+// reset all conn-related things
+// if err is nil, that means dial first time
+func (conn *Connection) reset(err error) error {
+	if err == nil {
+		conn.opts.logger.Infof("new connection dial connection %s start...",
+			conn.Address)
+	}
+	if errors.Is(err, net.ErrClosed) || errors.Is(err, context.Canceled) {
+		return fmt.Errorf("former error %v, should exit...", err)
+	}
+	retry := false
+	if err != nil {
+		retry = true
+		conn.Close()
+	}
+	if err := conn.dialTimes(retry); err != nil {
+		return err
+	}
+
+	conn.connected = true
+	conn.closeOnce = new(sync.Once)
+	conn.buffer = bufio.NewReadWriter(bufio.NewReaderSize(conn.c, 16*1024),
+		bufio.NewWriter(conn.c))
+	if err := conn.auth(); err != nil {
+		return err
+	}
+
+	// create a send-reply goroutine
+	conn.srWg.Add(1)
+	ctx, cancel := context.WithCancel(context.Background())
+	conn.srCancel = cancel
+	go conn.sendReply(ctx)
+
+	if conn.opts.autoRedial {
+		conn.MustSendOK(ctx, "event", "plain", HEARTBEAT.String())
+	}
+
+	conn.Handler.OnConnect(conn)
+
+	return nil
+}
+
+func emptyTickerChan(ticker *time.Ticker) {
+	// loop seems uncessary, but still keep that
+	for {
+		select {
+		case <-ticker.C:
+		default:
+			return
+		}
+	}
+}
+
+// goroutine send-reply to send command and receive reply/response
+func (conn *Connection) sendReply(ctx context.Context) {
+	defer conn.srWg.Done()
+	for {
+		var crh cmdReplyHandler
+		select {
+		case <-ctx.Done():
+			conn.opts.logger.Noticef("send-reply of %s cancel with error: %v\n",
+				conn.Address, ctx.Err())
+			return
+		case crh = <-conn.cmdReplyHandlers:
+		}
+
+		if err := conn.c.SetWriteDeadline(time.Now().Add(conn.opts.netDelay)); err != nil {
+			// conn is closing or deadline is 0
+			conn.opts.logger.Errorf("set write deadline: %v", err)
+		}
+
+		// NOTE: if arrive write deadline, socket may already write some bytes
+		_, err := conn.write(crh.cmd)
+		if err != nil {
+			// cannot detect write timeout, write will not waiting for tcp ACK
+			if lost, _ := connLost(err, 'w'); lost {
+				conn.opts.logger.Errorf("write error, send-reply exiting with err: %v", err)
+				goto connLossAccident
+			}
+			// TODO: need to be tested <2022-04-25, genmzy> //
+			conn.opts.logger.Warnf("write error: %v, continuing...", err)
+			continue
+		}
+
+		// empty ticker channel to avoid former arrived ticks
+		emptyTickerChan(conn.srTicker)
+
+		var ev *Event
+		ivals := 0
+	waitForReply:
+		for {
+			select {
+			case <-ctx.Done():
+				conn.opts.logger.Noticef("send-reply of %s cancel with error: %v\n", conn.Address, ctx.Err())
+				return
+			case ev = <-conn.cmdReply:
+				break waitForReply
+			case ev = <-conn.apiResp:
+				break waitForReply
+			case <-conn.srTicker.C:
+				// NOTE: 2 times ticker receive here for keeping at least 1 net delay interval
+				if ivals >= 2 {
+					conn.opts.logger.Debugf("receive 2 intervals, jumping to connLossAccident...")
+					goto connLossAccident
+				}
+				ivals++
+			}
+		}
+		if crh.rh != nil {
+			crh.rh(ev, err)
+		}
+	}
+
+connLossAccident:
+	conn.opts.logger.Debugf("reach connection loss accident")
+	// cancel read immediately, use any time.Time before or equals current time
+	// conn.c.SetReadDeadline(time.Now()) will make one more system call (?)
+	err := conn.c.SetReadDeadline(time.Unix(0, 0))
+	if err != nil {
+		conn.opts.logger.Errorf("set read deadline: %v", err)
+	}
+	return
 }
 
 // Create a new event socket connection and take a ConnectionHandler interface.
-// This will create a new 'sender' goroutine this goroutine will exit when call
-// goesl.Connection.Close()
-func NewConnection(host, passwd string, handler ConnHandler) (*Connection, error) {
+// This will create a new 'send-reply' goroutine this goroutine will exit when call
+// goesl.*Connection.Close()
+func Dial(addr, passwd string, handler ConnHandler, options ...Option) (*Connection, error) {
 	conn := Connection{
-		Address:  host,
+		Address:  addr,
 		Password: passwd,
-		Timeout:  3 * time.Second,
 		Handler:  handler,
 	}
-	conn.cmdReply = make(chan *Event, 10)
-	conn.apiResp = make(chan *Event, 10)
-	conn.sendRepHandlers = make(chan sendRepHandler, 10)
-	conn.logger = log.Default()
+	conn.opts = newOptions(options)
+	conn.waitings = make([]time.Duration, 0, conn.opts.maxRetries+1)
 
-	// create a sender
-	ctx, cancel := context.WithCancel(context.Background())
-	conn.senderCancel = cancel
-	go func(ctx context.Context) {
-		for {
-			var srh sendRepHandler
-			select {
-			case <-ctx.Done():
-				conn.logger.Printf("[goesl.NewConnection] sender of %s exiting with error: %v\n", conn.Address, ctx.Err())
-				return
-			case srh = <-conn.sendRepHandlers:
-			}
-			_, err := conn.Write(srh.Content)
-			if err != nil {
-				err = &Error{
-					Original: err,
-					Stack:    fmt.Sprintf("send command %s", string(srh.Content)),
-				}
-				// TODO: handle error here <2022-04-11, genmzy> //
-				conn.logger.Printf("[goesl.NewConnection] error: %v, will continue", err)
-				continue
-			}
-			var ev *Event
-			select {
-			case <-ctx.Done():
-				conn.logger.Printf("[goesl.NewConnection] sender of %s exiting with error: %v\n", conn.Address, ctx.Err())
-				return
-			case ev = <-conn.cmdReply:
-			case ev = <-conn.apiResp:
-			}
-			if srh.Handler != nil {
-				srh.Handler(ev, err)
-			}
-		}
-	}(ctx)
+	conn.cmdReply = make(chan *Event, conn.opts.sendReplyCap)
+	conn.apiResp = make(chan *Event, conn.opts.sendReplyCap)
+	conn.cmdReplyHandlers = make(chan cmdReplyHandler, conn.opts.sendReplyCap)
+	conn.srTicker = time.NewTicker(conn.opts.netDelay)
 
-	err := conn.connectRetry(3)
+	// do connect
+	err := conn.reset(nil)
 	if err != nil {
-		return nil, fmt.Errorf("connect: %v", err)
+		return nil, err
 	}
-	conn.Handler.OnConnect(&conn)
+
 	return &conn, nil
 }
 
@@ -110,12 +234,12 @@ func (conn *Connection) Send(ctx context.Context, h RepHandler, cmd string, args
 		buf.WriteString(arg)
 	}
 	buf.WriteString("\r\n\r\n")
-	srh := sendRepHandler{
-		Content: buf.Bytes(),
-		Handler: h,
+	crh := cmdReplyHandler{
+		cmd: buf.Bytes(),
+		rh:  h,
 	}
 	select {
-	case conn.sendRepHandlers <- srh:
+	case conn.cmdReplyHandlers <- crh:
 	case <-ctx.Done():
 	}
 }
@@ -123,10 +247,14 @@ func (conn *Connection) Send(ctx context.Context, h RepHandler, cmd string, args
 // must send and receive command, or fatal the process
 func (conn *Connection) MustSendOK(ctx context.Context, cmd string, args ...string) {
 	f := func(err error) {
-		if err != nil {
+		if err == nil {
 			return
 		}
-		conn.logger.Fatal(fmt.Sprintf("[esl.Connection.MustSendOK] with cmd: %s(%v) error: %v\n", cmd, args, err))
+		conn.opts.logger.Fatalf(
+			fmt.Sprintf("with cmd: %s(%v) error: %v\n",
+				cmd, args, err,
+			),
+		)
 	}
 	s := RepJustCareError{
 		CHandle: f,
@@ -137,7 +265,8 @@ func (conn *Connection) MustSendOK(ctx context.Context, cmd string, args ...stri
 
 // Send event to FreeSWITCH, this is NOT a API or BgAPI command
 // suggest: use RepJustCareError
-func (conn *Connection) SendEvent(ctx context.Context, h RepHandler, evName string, headers map[string]string, body []byte) {
+func (conn *Connection) SendEvent(ctx context.Context, h RepHandler, evName string,
+	headers map[string]string, body []byte) {
 	buf := bytes.NewBufferString("sendevent ")
 	buf.WriteString(evName)
 	buf.WriteString("\r\n")
@@ -147,12 +276,12 @@ func (conn *Connection) SendEvent(ctx context.Context, h RepHandler, evName stri
 	buf.WriteString(fmt.Sprintf("Content-Length: %d\r\n\r\n", len(body)))
 	buf.Write(body)
 
-	srh := sendRepHandler{
-		Content: buf.Bytes(),
-		Handler: h,
+	crh := cmdReplyHandler{
+		cmd: buf.Bytes(),
+		rh:  h,
 	}
 	select {
-	case conn.sendRepHandlers <- srh:
+	case conn.cmdReplyHandlers <- crh:
 	case <-ctx.Done():
 	}
 }
@@ -177,7 +306,8 @@ func (conn *Connection) BgApi(ctx context.Context, h ConnErrHandler, cmd string,
 
 // Execute an app on leg `uuid` and for `loops` times
 // suggest: use RepJustCareError
-func (conn *Connection) ExecuteLooped(ctx context.Context, h RepHandler, app string, uuid string, loops uint, params ...string) {
+func (conn *Connection) ExecuteLooped(ctx context.Context, h RepHandler, app string, uuid string,
+	loops uint, params ...string) {
 	args := strings.Join(params, " ")
 	cmd := Command{
 		Sync:  false,
@@ -191,7 +321,8 @@ func (conn *Connection) ExecuteLooped(ctx context.Context, h RepHandler, app str
 
 // Execute an app on leg `uuid` and for `loops` times, this app will not be interrupted util finish.
 // suggest: use RepJustCareError
-func (conn *Connection) ExecuteLoopedSync(ctx context.Context, h RepHandler, app string, uuid string, loops uint, params ...string) {
+func (conn *Connection) ExecuteLoopedSync(ctx context.Context, h RepHandler, app string, uuid string,
+	loops uint, params ...string) {
 	args := strings.Join(params, " ")
 	cmd := Command{
 		Sync:  true,
@@ -231,76 +362,120 @@ func (conn *Connection) ExecuteSync(ctx context.Context, h RepHandler, app strin
 	cmd.Execute(ctx, conn, h)
 }
 
-func (conn *Connection) connectRetry(mretries int) error {
-	for retries := 1; !conn.Connected && retries <= mretries; retries++ {
-		c, err := net.DialTimeout("tcp", conn.Address, conn.Timeout)
-		if err != nil {
-			if retries == mretries {
-				return fmt.Errorf("last dial attempt: %v", err)
-			}
-			conn.logger.Printf("[goesl.Connection.ConnectRetry] dial attempt #%d: %v, retrying\n", retries, err)
-		} else {
-			conn.socket = c
-			break
-		}
-	}
-	conn.buffer = bufio.NewReadWriter(bufio.NewReaderSize(conn.socket, 16*1024),
-		bufio.NewWriter(conn.socket))
-	return conn.authenticate()
+func (conn *Connection) makeBlock() {
+	conn.opts.logger.Debugf("set connection %s to block", conn.Address)
+	conn.c.SetDeadline(time.Time{})
 }
 
-// authenticate handles freeswitch esl authentication
-func (conn *Connection) authenticate() error {
-	ev, err := NewEventFromReader(conn.buffer.Reader)
+// auth handles freeswitch esl authentication
+func (conn *Connection) auth() error {
+	ev, err := conn.recvEvent()
 	if err != nil || ev.Type != EventAuth {
-		conn.socket.Close()
+		conn.c.Close()
 		if ev.Type != EventAuth {
-			return fmt.Errorf("bad auth preamble: [%s]", ev.Header)
+			return fmt.Errorf("bad auth preamble: [%s]", ev.header)
 		}
 		return fmt.Errorf("socket read error: %v", err)
 	}
 
 	var buf bytes.Buffer
-	buf.WriteString(fmt.Sprintf("auth %s\r\n\r\n", conn.Password))
-	if _, err := conn.Write(buf.Bytes()); err != nil {
-		conn.socket.Close()
+	buf.WriteString("auth ")
+	buf.WriteString(conn.Password)
+	buf.WriteString("\r\n\r\n")
+
+	conn.opts.logger.Debugf("set auth deadline for dial timeout %v", conn.opts.dialTimeout)
+	if err := conn.c.SetDeadline(time.Now().Add(conn.opts.dialTimeout)); err != nil {
+		return fmt.Errorf("set deadline after %v: %v", conn.opts.dialTimeout, err)
+	}
+	defer conn.makeBlock()
+	if _, err := conn.write(buf.Bytes()); err != nil {
+		conn.c.Close()
 		return fmt.Errorf("passwd buffer flush: %v", err)
 	}
 
-	ev, err = NewEventFromReader(conn.buffer.Reader)
+	ev, err = conn.recvEvent()
 	if err != nil {
-		conn.socket.Close()
+		conn.c.Close()
 		return fmt.Errorf("auth reply: %v", err)
 	}
 	if ev.Type != EventCommandReply {
-		conn.socket.Close()
+		conn.c.Close()
 		return fmt.Errorf("bad reply type: %#v", ev.Type)
 	}
-	conn.Connected = true
+	if reply := ev.Get("Reply-Text"); strings.HasPrefix(reply, "-ERR ") {
+		return fmt.Errorf("auth reply: %v", reply[5:])
+	}
 	return nil
 }
 
-// Receive events and handle them by `esl.ConnectionHandler` if the event is
+// return value: { is_connection_error, is_connection_error_by_accident }
+// never { false, true }
+func connLost(err error, mode byte) (bool, bool) {
+	switch mode {
+	case 'r': // read
+		if errors.Is(err, os.ErrDeadlineExceeded) {
+			return true, true
+		}
+		if errors.Is(err, io.EOF) {
+			return true, true
+		}
+		if errors.Is(err, io.ErrUnexpectedEOF) {
+			return true, true
+		}
+		if errors.Is(err, net.ErrClosed) {
+			return true, false
+		}
+	case 'w': // write
+		if errors.Is(err, os.ErrDeadlineExceeded) {
+			return true, true
+		}
+		if errors.Is(err, syscall.EPIPE) {
+			return true, true
+		}
+		if errors.Is(err, net.ErrClosed) {
+			return true, false
+		}
+	}
+	return false, false
+}
+
+// Receive events and handle them by `goesl.ConnectionHandler`
+// if error returned is not `os.ErrClosed` or `context.ErrCanceled`
+// that means unexpected error occurred. To distingush that, you can use:
+// `errors.Is(err, net.ErrClosed) || errors.Is(err, context.Canceled)`
 func (conn *Connection) HandleEvents(ctx context.Context) error {
-	for conn.Connected {
+	defer func() {
+		conn.opts.logger.Noticef("waiting for send-reply exiting...")
+		if !conn.opts.autoRedial && conn.connected { // this is a timeout exception
+			conn.opts.logger.Infof("connection disable automatic redial, so call send-reply cancel function.")
+			conn.srCancel()
+		}
+		conn.srWg.Wait()
+		conn.opts.logger.Noticef("waiting for send-reply exiting done.")
+	}()
+	for conn.connected {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 		default:
 		}
-		ev, err := NewEventFromReader(conn.buffer.Reader)
+		ev, err := conn.recvEvent()
 		if err != nil {
-			if rErr, ok := err.(*Error); ok {
-				rErr.WithStack("event read loop")
-				return rErr
+			if lost, accident := connLost(err, 'r'); lost {
+				if conn.opts.autoRedial && accident {
+					if err := conn.reset(err); err != nil {
+						return err
+					}
+					continue
+				}
+				return err
 			}
-			// TODO: may be a handler here <2022-04-12, genmzy> //
-			conn.logger.Printf("[goesl.Connection.HandleEvents] new event from reader: %v", err)
+			conn.opts.logger.Warnf("recvEvent: %v, continuing...", err)
 			continue
 		}
 		switch ev.Type {
 		case EventInvalid:
-			return fmt.Errorf("invalid event: [%s]", ev)
+			conn.opts.logger.Errorf("invalid event: [%s]", ev)
 		case EventDisconnect:
 			conn.Handler.OnDisconnect(conn, ev)
 		case EventCommandReply:
@@ -322,21 +497,89 @@ func (conn *Connection) HandleEvents(ctx context.Context) error {
 	return fmt.Errorf("disconnected")
 }
 
-func (conn *Connection) Write(b []byte) (int, error) {
-	defer conn.buffer.Flush()
-	return conn.buffer.Write(b)
-}
-
-func (conn *Connection) Close() {
-	if conn.Connected {
-		conn.Connected = false
-		conn.Handler.OnClose(conn)
+// NOTE: an error impletion:
+//    defer conn.buffer.Flush()
+//    return conn.buffer.Write()
+// this will ignore the real connection write error that in `Flush`
+func (conn *Connection) write(b []byte) (int, error) {
+	n, err := conn.buffer.Write(b)
+	if err != nil {
+		return n, err
 	}
-	conn.senderCancel() // close sender goroutine
-	conn.socket.Close()
+	err = conn.buffer.Flush()
+	return n, err
 }
 
-// set logger for print esl package inner message output
-func (conn *Connection) SetLogger(l EslLogger) {
-	conn.logger = l
+// Close the connection and make send-reply exit as soon as possible
+// ignore all errors here because may the connection already lost
+//
+// Close is protected by sync.Once, so you can call this for twice or more
+func (conn *Connection) Close() {
+	conn.closeOnce.Do(func() {
+		if conn.connected {
+			conn.connected = false
+			conn.Handler.OnClose(conn)
+		}
+		conn.srCancel() // close send-reply goroutine
+		// cancel write immediately, use any time.Time before or equals current time
+		// conn.c.SetReadDeadline(time.Now()) will make one more system call (?)
+		conn.c.SetDeadline(time.Unix(0, 0))
+		conn.c.Close()
+	})
+}
+
+func (conn *Connection) recvEvent() (*Event, error) {
+	var err error
+	e := &Event{}
+	r := conn.buffer.Reader
+
+	if conn.opts.autoRedial {
+		rd := conn.opts.heartbeat + conn.opts.netDelay
+		// conn.opts.logger.Debugf("automatic redial enable with heartbeat, set read deadline %v", rd)
+		err = conn.c.SetReadDeadline(time.Now().Add(rd))
+		if err != nil {
+			// conn is closing or ctx is 0, just return
+			return nil, err
+		}
+	}
+
+	e.header.Map, err = textproto.NewReader(r).ReadMIMEHeader()
+	if err != nil {
+		return nil, err
+	}
+
+	if slen := e.Get("Content-Length"); slen != "" {
+		len, err := strconv.Atoi(slen)
+		if err != nil {
+			return nil, fmt.Errorf("convert content-length %s: %v", slen, err)
+		}
+		e.rawBody = make([]byte, len)
+		_, err = io.ReadFull(r, e.rawBody)
+		if err != nil {
+			return nil, fmt.Errorf("read body: %v", err)
+		}
+	}
+
+	switch t := e.Get("Content-Type"); t {
+	case "auth/request":
+		e.Type = EventAuth
+	case "command/reply":
+		e.Type = EventCommandReply
+		reply := e.Get("Reply-Text")
+		if strings.Contains(reply, "%") {
+			e.header.IsEscaped = true
+		}
+	case "text/event-plain":
+		e.Type = EventGeneric
+		err = e.parseTextBody()
+	case "text/event-json", "text/event-xml":
+		err = fmt.Errorf("unsupported format %s", t)
+	case "text/disconnect-notice", "text/rude-rejection":
+		e.Type = EventDisconnect
+	case "api/response":
+		e.Type = EventApiResponse
+	default:
+		e.Type = EventInvalid
+	}
+	return e, err
 }

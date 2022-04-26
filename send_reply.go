@@ -13,9 +13,9 @@ type RepHandler func(*Event, error)
 type ConnErrHandler func(error)
 type RepErrHandler func(error)
 
-type sendRepHandler struct {
-	Content []byte
-	Handler RepHandler
+type cmdReplyHandler struct {
+	cmd []byte
+	rh  RepHandler
 }
 
 // ------------------------------ helper for reply ------------------------------- //

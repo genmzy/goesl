@@ -45,12 +45,12 @@ func (cmd *Command) Serialize() []byte {
 // Returns the command reply event pointer or an error if any.
 // suggest: use RepJustCareError
 func (cmd Command) Execute(ctx context.Context, conn *Connection, h RepHandler) {
-	srh := sendRepHandler{
-		Content: cmd.Serialize(),
-		Handler: h,
+	srh := cmdReplyHandler{
+		cmd: cmd.Serialize(),
+		rh:  h,
 	}
 	select {
-	case conn.sendRepHandlers <- srh:
+	case conn.cmdReplyHandlers <- srh:
 	case <-ctx.Done():
 	}
 }

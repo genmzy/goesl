@@ -3,11 +3,14 @@ package main
 import (
 	"bufio"
 	"context"
+	"errors"
 	"fmt"
-	"io"
 	"log"
+	"net"
 	"os"
+	"os/signal"
 	"strings"
+	"syscall"
 	"time"
 
 	. "github.com/genmzy/goesl"
@@ -25,11 +28,33 @@ const (
 
 func main() {
 	handler := &Handler{}
-	conn, err := NewConnection("127.0.0.1:8021", "ClueCon", handler)
+	conn, err := Dial(
+		"127.0.0.1:8021",
+		// "10.172.49.21:8021",
+		"ClueCon",
+		handler,
+		WithDefaultAutoRedial(),
+		WithHeartBeat(20*time.Second),
+		WithNetDelay(2*time.Second),
+		WithMaxRetries(-1),
+		WithLogLevel(LevelDebug),
+	)
 	if err != nil {
-		log.Fatal("ERR connecting to freeswitch:", err)
+		log.Fatal("connecting to freeswitch: ", err)
 	}
-	conn.SetLogger(log.Default())
+	// close twice is allowed
+	defer conn.Close()
+
+	go func() {
+		sigs := make(chan os.Signal)
+		signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
+		defer signal.Stop(sigs)
+		select {
+		case <-sigs:
+			panic("show all goroutines")
+		}
+	}()
+
 	ctx, cancel := context.WithCancel(context.Background())
 	go func(ctx context.Context) {
 		s := bufio.NewScanner(os.Stdin)
@@ -42,25 +67,25 @@ func main() {
 			case "exit":
 				fallthrough
 			case "quit":
-				log.Println("exiting...")
-				conn.Send(ctx, func(e *Event, err error) {
-					fmt.Println("disconnect reply:", e)
-					if err != nil {
-						log.Fatal(err)
-					}
-				}, "...")
 				cancel()
+				// close twice is allowed
+				conn.Close()
 				return
 			default:
+				log.Println("send commands: ", cmd)
 				conn.Api(ctx, func(e *Event, err error) {
 					fmt.Println(e.GetTextBody())
 				}, cmd)
 			}
 		}
 	}(ctx)
-	log.Println("handle events exit:", conn.HandleEvents(ctx))
-	conn.Close()
-	time.Sleep(2 * time.Second)
+
+	err = conn.HandleEvents(ctx)
+	if errors.Is(err, net.ErrClosed) || errors.Is(err, context.Canceled) {
+		log.Println("process exiting...")
+	} else {
+		log.Fatalf("exiting with error: %v", err)
+	}
 }
 
 func okOrDie(err error) {
@@ -69,30 +94,19 @@ func okOrDie(err error) {
 	}
 }
 
-func connErrHandle(err error) {
-	if err == nil {
-		return
-	}
-	if wErr, ok := err.(*Error); ok {
-		// TODO: retry or something
-		switch wErr.Original {
-		case io.EOF:
-			fallthrough
-		case io.EOF:
-			fallthrough
-		case io.ErrUnexpectedEOF:
-			fallthrough
-		case io.ErrClosedPipe:
-			log.Printf("connection write occuried cause err: %v, please retry.\n", wErr)
-		}
-	}
+func errHandle(err error) {
+	return
 }
 
 func (h *Handler) OnConnect(conn *Connection) {
 	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
 	defer cancel()
-	conn.MustSendOK(ctx, "event", "plain", "ALL")
+	conn.MustSendOK(
+		ctx, "event", "plain",
+		CHANNEL_ANSWER.String(), CHANNEL_HANGUP.String(), BACKGROUND_JOB.String(),
+	)
 
+	// this will console log `err: stat Command not found!`
 	conn.Api(ctx, func(e *Event, err error) {
 		if err != nil {
 			log.Fatal(err)
@@ -111,10 +125,10 @@ func (h *Handler) OnConnect(conn *Connection) {
 
 	h.BgJobId = conn.BgApi(
 		ctx,
-		connErrHandle,
+		nil,
 		"originate",
 		"{origination_uuid="+h.CallId+",origination_caller_id_number="+Caller+"}user/"+Callee,
-		"&playback(local_stream://moh)",
+		"&echo()",
 	)
 	log.Println("originate bg job id:", h.BgJobId)
 }
@@ -134,7 +148,7 @@ func (h *Handler) OnEvent(ctx context.Context, con *Connection, ev *Event) {
 	log.Printf("%s - event %s %s %s\n", ev.UId, ev.Name, ev.App, ev.AppData)
 	switch ev.Name {
 	case BACKGROUND_JOB:
-		log.Printf("bg job result:%s\n", ev.GetTextBody())
+		log.Printf("bg job result: %s\n", ev.GetTextBody())
 	case CHANNEL_ANSWER:
 		log.Println("call answered, starting moh")
 		con.Execute(ctx, nil, "playback", h.CallId, "local_stream://moh")
