@@ -157,3 +157,14 @@ func WithLogOutput(w io.Writer) Option {
 		},
 	}
 }
+
+func WithLogPrefix(s string) Option {
+	return Option{
+		f: func(o *Options) {
+			if o.logger != logger {
+				return
+			}
+			logger.SetPrefix(s)
+		},
+	}
+}

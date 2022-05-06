@@ -5,7 +5,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log"
 	"net"
 	"os"
 	"os/signal"
@@ -38,9 +37,10 @@ func main() {
 		WithNetDelay(2*time.Second),
 		WithMaxRetries(-1),
 		WithLogLevel(LevelDebug),
+		WithLogPrefix("<fs_cli>"),
 	)
 	if err != nil {
-		log.Fatal("connecting to freeswitch: ", err)
+		Fatalf("connecting to freeswitch: ", err)
 	}
 	// close twice is allowed
 	defer conn.Close()
@@ -72,7 +72,7 @@ func main() {
 				conn.Close()
 				return
 			default:
-				log.Println("send commands: ", cmd)
+				Debugf("send commands: ", cmd)
 				conn.Api(ctx, func(e *Event, err error) {
 					fmt.Println(e.GetTextBody())
 				}, cmd)
@@ -82,15 +82,15 @@ func main() {
 
 	err = conn.HandleEvents(ctx)
 	if errors.Is(err, net.ErrClosed) || errors.Is(err, context.Canceled) {
-		log.Println("process exiting...")
+		Noticef("process exiting...")
 	} else {
-		log.Fatalf("exiting with error: %v", err)
+		Errorf("exiting with error: %v", err)
 	}
 }
 
 func okOrDie(err error) {
 	if err != nil {
-		log.Fatal(err)
+		Fatalf(err.Error())
 	}
 }
 
@@ -109,18 +109,18 @@ func (h *Handler) OnConnect(conn *Connection) {
 	// this will console log `err: stat Command not found!`
 	conn.Api(ctx, func(e *Event, err error) {
 		if err != nil {
-			log.Fatal(err)
+			Fatalf(err.Error())
 		}
 		body := e.GetTextBody()
 		if strings.HasPrefix(body, "-ERR ") {
-			log.Println("err:", body[5:])
+			Errorf("err:", body[5:])
 		}
 	}, "stat")
 
 	conn.Api(ctx, func(e *Event, err error) {
-		log.Println("uuid:", e.GetTextBody())
+		Debugf("uuid:", e.GetTextBody())
 		h.CallId = e.GetTextBody()
-		log.Println("call id:", h.CallId)
+		Debugf("call id:", h.CallId)
 	}, "create_uuid")
 
 	h.BgJobId = conn.BgApi(
@@ -130,30 +130,28 @@ func (h *Handler) OnConnect(conn *Connection) {
 		"{origination_uuid="+h.CallId+",origination_caller_id_number="+Caller+"}user/"+Callee,
 		"&echo()",
 	)
-	log.Println("originate bg job id:", h.BgJobId)
+	Debugf("originate bg job id:", h.BgJobId)
 }
 
 func (h *Handler) OnDisconnect(conn *Connection, ev *Event) {
-	log.Println("esl disconnected:", ev)
+	Noticef("esl disconnected:", ev)
 }
 
 func (h *Handler) OnClose(con *Connection) {
-	log.Println("esl connection closed")
+	Noticef("esl connection closed")
 }
 
 func (h *Handler) OnEvent(ctx context.Context, con *Connection, ev *Event) {
-	if ev.Type == EventGeneric {
-		log.Printf("fire time: %s\n", ev.Fire.StdTime().Format("2006-01-02 15:04:05"))
-	}
-	log.Printf("%s - event %s %s %s\n", ev.UId, ev.Name, ev.App, ev.AppData)
+	Debugf("fire time: %s\n", ev.Fire.StdTime().Format("2006-01-02 15:04:05"))
+	Debugf("%s - event %s %s %s\n", ev.UId, ev.Name, ev.App, ev.AppData)
 	switch ev.Name {
 	case BACKGROUND_JOB:
-		log.Printf("bg job result: %s\n", ev.GetTextBody())
+		Noticef("bg job result: %s\n", ev.GetTextBody())
 	case CHANNEL_ANSWER:
-		log.Println("call answered, starting moh")
+		Noticef("call answered, starting moh")
 		con.Execute(ctx, nil, "playback", h.CallId, "local_stream://moh")
 	case CHANNEL_HANGUP:
 		cause := ev.Get("Hangup-Cause")
-		log.Printf("call terminated with cause %s", cause)
+		Noticef("call terminated with cause %s", cause)
 	}
 }

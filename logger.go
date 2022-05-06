@@ -13,6 +13,7 @@ import (
 type Logger interface {
 	SetLevel(Level)
 	SetOutput(io.Writer)
+	SetPrefix(string)
 
 	Debugf(format string, v ...interface{})
 	Infof(format string, v ...interface{})
@@ -51,4 +52,28 @@ func (lv Level) String() string {
 		return strs[lv]
 	}
 	return fmt.Sprintf("[?%d] ", lv)
+}
+
+func Debugf(format string, v ...interface{}) {
+	logger.logf(LevelDebug, format, v...)
+}
+
+func Infof(format string, v ...interface{}) {
+	logger.logf(LevelInfo, format, v...)
+}
+
+func Noticef(format string, v ...interface{}) {
+	logger.logf(LevelNotice, format, v...)
+}
+
+func Warnf(format string, v ...interface{}) {
+	logger.logf(LevelWarn, format, v...)
+}
+
+func Errorf(format string, v ...interface{}) {
+	logger.logf(LevelError, format, v...)
+}
+
+func Fatalf(format string, v ...interface{}) {
+	logger.logf(LevelFatal, format, v...)
 }

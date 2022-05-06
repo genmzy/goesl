@@ -50,6 +50,10 @@ func (l *defaultLogger) SetOutput(w io.Writer) {
 	l.stdlog.SetOutput(w)
 }
 
+func (l *defaultLogger) SetPrefix(s string) {
+	l.stdlog.SetPrefix(s)
+}
+
 func (l *defaultLogger) logf(lv Level, format string, v ...interface{}) {
 	if l.level > lv {
 		return
