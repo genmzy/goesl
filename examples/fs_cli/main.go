@@ -73,7 +73,7 @@ func main() {
 				return
 			default:
 				Debugf("send commands: ", cmd)
-				conn.Api(ctx, func(e *Event, err error) {
+				conn.Api(ctx, func(e Event, err error) {
 					fmt.Println(e.GetTextBody())
 				}, cmd)
 			}
@@ -107,7 +107,7 @@ func (h *Handler) OnConnect(conn *Connection) {
 	)
 
 	// this will console log `err: stat Command not found!`
-	conn.Api(ctx, func(e *Event, err error) {
+	conn.Api(ctx, func(e Event, err error) {
 		if err != nil {
 			Fatalf(err.Error())
 		}
@@ -117,7 +117,7 @@ func (h *Handler) OnConnect(conn *Connection) {
 		}
 	}, "stat")
 
-	conn.Api(ctx, func(e *Event, err error) {
+	conn.Api(ctx, func(e Event, err error) {
 		Debugf("uuid:", e.GetTextBody())
 		h.CallId = e.GetTextBody()
 		Debugf("call id:", h.CallId)
@@ -133,7 +133,7 @@ func (h *Handler) OnConnect(conn *Connection) {
 	Debugf("originate bg job id:", h.BgJobId)
 }
 
-func (h *Handler) OnDisconnect(conn *Connection, ev *Event) {
+func (h *Handler) OnDisconnect(conn *Connection, ev Event) {
 	Noticef("esl disconnected:", ev)
 }
 
@@ -141,7 +141,7 @@ func (h *Handler) OnClose(con *Connection) {
 	Noticef("esl connection closed")
 }
 
-func (h *Handler) OnEvent(ctx context.Context, con *Connection, ev *Event) {
+func (h *Handler) OnEvent(ctx context.Context, con *Connection, ev Event) {
 	Debugf("fire time: %s\n", ev.Fire.StdTime().Format("2006-01-02 15:04:05"))
 	Debugf("%s - event %s %s %s\n", ev.UId, ev.Name, ev.App, ev.AppData)
 	switch ev.Name {

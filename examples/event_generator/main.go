@@ -5,8 +5,10 @@ import (
 	"context"
 	"net"
 	"os"
-	"runtime"
+	"os/signal"
+	"runtime/trace"
 	"sync"
+	"syscall"
 	"time"
 
 	. "github.com/genmzy/goesl"
@@ -27,7 +29,7 @@ func (h *Handler) OnConnect(conn *Connection) {
 	conn.MustSendOK(ctx, "event", "plain", "ALL")
 }
 
-func (h *Handler) OnDisconnect(conn *Connection, ev *Event) {
+func (h *Handler) OnDisconnect(conn *Connection, ev Event) {
 	Noticef("esl disconnected:", ev)
 }
 
@@ -35,7 +37,7 @@ func (h *Handler) OnClose(con *Connection) {
 	Noticef("esl connection closed")
 }
 
-func (h *Handler) OnEvent(ctx context.Context, con *Connection, ev *Event) {
+func (h *Handler) OnEvent(ctx context.Context, con *Connection, ev Event) {
 	go func() {
 		time.Sleep(2 * time.Millisecond)
 		Noticef("%s with fire time: %s\n", ev.Name, ev.Fire.StdTime().Format(timeFormat))
@@ -43,13 +45,24 @@ func (h *Handler) OnEvent(ctx context.Context, con *Connection, ev *Event) {
 }
 
 func main() {
-	runtime.GOMAXPROCS(2)
 	listener, err := net.Listen("tcp", ":8071")
 	if err != nil {
 		Fatalf(err.Error())
 	}
 	defer listener.Close()
 	go func() {
+		sigs := make(chan os.Signal)
+		signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM, syscall.SIGQUIT, syscall.SIGSTOP)
+		defer signal.Stop(sigs)
+
+		tracer, err := os.Create("./bin/trace.out")
+		if err != nil {
+			Fatalf("create file trace.out failed: %v", err)
+		}
+		defer tracer.Close()
+		trace.Start(tracer)
+		defer trace.Stop()
+
 		time.Sleep(2 * time.Second)
 		Debugf("call start")
 		f, err := os.OpenFile(
@@ -73,6 +86,13 @@ func main() {
 			Fatalf(err.Error())
 		}
 		ctx, cancel := context.WithCancel(context.Background())
+		go func() {
+			select {
+			case <-sigs:
+				cancel()
+				conn.Close()
+			}
+		}()
 		conn.HandleEvents(ctx)
 		cancel()
 	}()
@@ -100,7 +120,8 @@ func main() {
 		writer.Flush()
 	})
 	for {
-		time.Sleep(2 * time.Microsecond)
+		//time.Sleep(2 * time.Microsecond)
+		time.Sleep(2 * time.Millisecond)
 		writer.Write(heartbeat)
 		writer.Flush()
 	}

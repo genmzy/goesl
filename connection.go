@@ -25,8 +25,8 @@ import (
 
 type ConnHandler interface {
 	OnConnect(*Connection)
-	OnDisconnect(*Connection, *Event)
-	OnEvent(context.Context, *Connection, *Event)
+	OnDisconnect(*Connection, Event)
+	OnEvent(context.Context, *Connection, Event)
 	OnClose(*Connection)
 }
 
@@ -40,8 +40,8 @@ type Connection struct {
 
 	opts *Options
 
-	cmdReply chan *Event
-	apiResp  chan *Event
+	cmdReply chan Event
+	apiResp  chan Event
 	Handler  ConnHandler
 	Address  string
 	Password string
@@ -163,7 +163,7 @@ func (conn *Connection) sendReply(ctx context.Context) {
 		// empty ticker channel to avoid former arrived ticks
 		emptyTickerChan(conn.srTicker)
 
-		var ev *Event
+		var ev Event
 		ivals := 0
 	waitForReply:
 		for {
@@ -212,8 +212,8 @@ func Dial(addr, passwd string, handler ConnHandler, options ...Option) (*Connect
 	conn.opts = newOptions(options)
 	conn.waitings = make([]time.Duration, 0, conn.opts.maxRetries+1)
 
-	conn.cmdReply = make(chan *Event, conn.opts.sendReplyCap)
-	conn.apiResp = make(chan *Event, conn.opts.sendReplyCap)
+	conn.cmdReply = make(chan Event, conn.opts.sendReplyCap)
+	conn.apiResp = make(chan Event, conn.opts.sendReplyCap)
 	conn.cmdReplyHandlers = make(chan cmdReplyHandler, conn.opts.sendReplyCap)
 	conn.srTicker = time.NewTicker(conn.opts.netDelay)
 
@@ -528,9 +528,9 @@ func (conn *Connection) Close() {
 	})
 }
 
-func (conn *Connection) recvEvent() (*Event, error) {
+func (conn *Connection) recvEvent() (Event, error) {
 	var err error
-	e := &Event{}
+	e := Event{Type: EventInvalid}
 	r := conn.buffer.Reader
 
 	if conn.opts.autoRedial {
@@ -539,24 +539,24 @@ func (conn *Connection) recvEvent() (*Event, error) {
 		err = conn.c.SetReadDeadline(time.Now().Add(rd))
 		if err != nil {
 			// conn is closing or ctx is 0, just return
-			return nil, err
+			return e, err
 		}
 	}
 
 	e.header.Map, err = textproto.NewReader(r).ReadMIMEHeader()
 	if err != nil {
-		return nil, err
+		return e, err
 	}
 
 	if slen := e.Get("Content-Length"); slen != "" {
 		len, err := strconv.Atoi(slen)
 		if err != nil {
-			return nil, fmt.Errorf("convert content-length %s: %v", slen, err)
+			return e, fmt.Errorf("convert content-length %s: %v", slen, err)
 		}
 		e.rawBody = make([]byte, len)
 		_, err = io.ReadFull(r, e.rawBody)
 		if err != nil {
-			return nil, fmt.Errorf("read body: %v", err)
+			return e, fmt.Errorf("read body: %v", err)
 		}
 	}
 

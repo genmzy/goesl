@@ -9,7 +9,7 @@ import (
 	"strings"
 )
 
-type RepHandler func(*Event, error)
+type RepHandler func(Event, error)
 type ConnErrHandler func(error)
 type RepErrHandler func(error)
 
@@ -25,7 +25,7 @@ type RepJustCareError struct {
 	RHandle RepErrHandler
 }
 
-func (r *RepJustCareError) RepHandle(ev *Event, err error) {
+func (r *RepJustCareError) RepHandle(ev Event, err error) {
 	if err != nil && r.CHandle != nil {
 		r.CHandle(err)
 	}
@@ -50,7 +50,7 @@ type RepBgUuid struct {
 }
 
 // only -ERR permission denied when userauth, not support now
-func (r *RepBgUuid) RepHandle(ev *Event, err error) {
+func (r *RepBgUuid) RepHandle(ev Event, err error) {
 	// ignore event receive
 	if err != nil && r.CHandle != nil {
 		r.CHandle(err)

@@ -168,7 +168,7 @@ const (
 	ALL
 )
 
-func (e *Event) GetTextBody() string {
+func (e Event) GetTextBody() string {
 	if e.Type == EventApiResponse {
 		resp := strings.TrimSpace(string(e.rawBody))
 		return string(resp)
