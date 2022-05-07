@@ -7,6 +7,7 @@ package goesl
 import (
 	"bufio"
 	"bytes"
+	"errors"
 	"fmt"
 	"net/textproto"
 	"net/url"
@@ -16,13 +17,15 @@ import (
 )
 
 type mimeMap struct {
-	Map       textproto.MIMEHeader
-	IsEscaped bool
+	headers textproto.MIMEHeader
+	escaped bool
 }
 
+var ErrMismatchEventType = errors.New("mismatch event type")
+
 func (m mimeMap) get(key string) string {
-	val := m.Map.Get(key)
-	if m.IsEscaped {
+	val := m.headers.Get(key)
+	if m.escaped {
 		val, _ = url.QueryUnescape(val)
 	}
 	return val
@@ -30,9 +33,9 @@ func (m mimeMap) get(key string) string {
 
 func (m mimeMap) String() string {
 	var s string
-	for k, v := range m.Map {
+	for k, v := range m.headers {
 		val := strings.Join(v, ",")
-		if m.IsEscaped {
+		if m.escaped {
 			val, _ = url.QueryUnescape(val)
 		}
 		s += fmt.Sprintf("%s: %s\n", k, val)
@@ -47,12 +50,7 @@ func (t FireTime) StdTime() time.Time {
 }
 
 type Event struct {
-	UId     string
-	Name    EventName
-	App     string
-	AppData string
-	Fire    FireTime
-	Type    EventType
+	Type EventType
 
 	header  mimeMap
 	body    mimeMap
@@ -179,6 +177,7 @@ func (e Event) GetTextBody() string {
 	}
 	bblen, err := strconv.Atoi(slen)
 	if err != nil {
+		Warnf("content length parse error: %v", err)
 		return ""
 	}
 	blen := len(e.rawBody)
@@ -203,15 +202,132 @@ func (e Event) String() string {
 func (e *Event) parseTextBody() error {
 	var err error
 	buf := bufio.NewReader(bytes.NewReader(e.rawBody))
-	if e.body.Map, err = textproto.NewReader(buf).ReadMIMEHeader(); err != nil {
+	if e.body.headers, err = textproto.NewReader(buf).ReadMIMEHeader(); err != nil {
 		return fmt.Errorf("parse text body: %v", err)
 	}
-	e.body.IsEscaped = true
-	e.UId = e.Get("Unique-ID")
-	e.Name, _ = EventNameString(e.Get("Event-Name"))
-	e.App = e.Get("Application")
-	e.AppData = strings.TrimSpace(e.Get("Application-Data"))
-	t, err := strconv.ParseUint(e.Get("Event-Date-Timestamp"), 10, 64)
-	e.Fire = FireTime(t) // ignore err or not
+	e.body.escaped = true // all generic events are regard as escaped
 	return err
+}
+
+// --------------------- helper to event get -------------------------- //
+
+// generic event headers
+const (
+	// Core uuid
+	Core_Uuid = "Core-UUID"
+	// event innate attributions
+	Event_Name           = "Event-Name"
+	Event_Sequence       = "Event-Sequence"
+	FreeSWITCH_IPv4      = "FreeSWITCH-IPv4"
+	Event_Date_Timestamp = "Event-Date-Timestamp"
+	// background job related
+	BgJob_Uuid        = "Job-Uuid"
+	BgJob_Command     = "Job-Command"
+	BgJob_Command_Arg = "Job-Command-Arg"
+	// leg uuid
+	Unique_ID           = "Unique-ID"
+	Channel_State       = "Channel-State"
+	Call_Direction      = "Call-Direction"
+	Other_Leg_Unique_ID = "Other-Leg-Unique-ID"
+	// caller
+	Caller_ID_Number    = "Caller-Caller-ID-Number"
+	Callee_ID_Number    = "Caller-Destination-Number"
+	Caller_Network_Addr = "Caller-Network-Addr"
+	// variables
+	Sip_From_Uri = "variable_sip_from_uri"
+	// digits
+	DTMF_Digit  = "DTMF-Digit"
+	DTMF_Source = "DTMF-Source"
+	// hangup cause
+	Hangup_Cause = "Hangup-Cause"
+	// current application
+	CurrentApp     = "variable_current_application"
+	CurrentAppData = "variable_current_application_data"
+	// application
+	Application      = "Application"
+	Application_Data = "Application-Data"
+)
+
+func (e Event) Name() EventName {
+	en, err := EventNameString(e.Get(Event_Name))
+	if err != nil {
+		Warnf("parse event name error: %v", err)
+		return CUSTOM
+	}
+	return en
+}
+
+func (e Event) FireTime() FireTime {
+	ft, err := strconv.ParseInt(e.Get(Event_Date_Timestamp), 10, 64)
+	if err != nil {
+		Warnf("parse fire time error: %v", err)
+		return 0
+	}
+	return FireTime(ft)
+}
+
+func (e Event) CoreUuid() string {
+	return e.Get(Core_Uuid)
+}
+
+func (e Event) CallUuid() string {
+	return e.Get(Unique_ID)
+}
+
+// app and data
+func (e Event) App() (string, string) {
+	return e.Get(Application_Data), e.Get(Application_Data)
+}
+
+// current app and data
+func (e Event) CurrentApp() (string, string) {
+	return e.Get(CurrentApp), e.Get(CurrentAppData)
+}
+
+func (e Event) Digits() string {
+	return e.Get(DTMF_Digit)
+}
+
+func (e Event) DigitsSource() string {
+	return e.Get(DTMF_Source)
+}
+
+func (e Event) CallDirection() string {
+	return e.Get(Call_Direction)
+}
+
+func (e Event) Caller() string {
+	return e.Get(Caller_ID_Number)
+}
+
+func (e Event) Callee() string {
+	return e.Get(Callee_ID_Number)
+}
+
+func (e Event) Sequence() string {
+	return e.Get(Event_Sequence)
+}
+
+func (e Event) SipFrom() string {
+	return e.Get(Sip_From_Uri)
+}
+
+func (e Event) CoreNetworkAddr() string {
+	return e.Get(Caller_Network_Addr)
+}
+
+func (e Event) CoreIP() string {
+	return e.Get(FreeSWITCH_IPv4)
+}
+
+func (e Event) BgJob() string {
+	return e.Get(BgJob_Uuid)
+}
+
+func (e Event) BgCommand() (string, string) {
+	return e.Get(BgJob_Command), e.Get(BgJob_Command_Arg)
+}
+
+func (e Event) BgJobResponse() string {
+	return e.GetTextBody()
 }

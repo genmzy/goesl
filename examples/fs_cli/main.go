@@ -113,14 +113,14 @@ func (h *Handler) OnConnect(conn *Connection) {
 		}
 		body := e.GetTextBody()
 		if strings.HasPrefix(body, "-ERR ") {
-			Errorf("err:", body[5:])
+			Errorf("err: %s", body[5:])
 		}
 	}, "stat")
 
 	conn.Api(ctx, func(e Event, err error) {
-		Debugf("uuid:", e.GetTextBody())
+		Debugf("uuid: %s", e.GetTextBody())
 		h.CallId = e.GetTextBody()
-		Debugf("call id:", h.CallId)
+		Debugf("call id: %s", h.CallId)
 	}, "create_uuid")
 
 	h.BgJobId = conn.BgApi(
@@ -130,7 +130,7 @@ func (h *Handler) OnConnect(conn *Connection) {
 		"{origination_uuid="+h.CallId+",origination_caller_id_number="+Caller+"}user/"+Callee,
 		"&echo()",
 	)
-	Debugf("originate bg job id:", h.BgJobId)
+	Debugf("originate bg job id: %s", h.BgJobId)
 }
 
 func (h *Handler) OnDisconnect(conn *Connection, ev Event) {
@@ -141,17 +141,19 @@ func (h *Handler) OnClose(con *Connection) {
 	Noticef("esl connection closed")
 }
 
-func (h *Handler) OnEvent(ctx context.Context, con *Connection, ev Event) {
-	Debugf("fire time: %s\n", ev.Fire.StdTime().Format("2006-01-02 15:04:05"))
-	Debugf("%s - event %s %s %s\n", ev.UId, ev.Name, ev.App, ev.AppData)
-	switch ev.Name {
+func (h *Handler) OnEvent(ctx context.Context, con *Connection, e Event) {
+	Debugf("fire time: %s\n", e.FireTime().StdTime().Format("2006-01-02 15:04:05"))
+	en := e.Name()
+	app, appData := e.App()
+	Debugf("%s - event %s %s %s\n", e.CallUuid(), en, app, appData)
+	switch en {
 	case BACKGROUND_JOB:
-		Noticef("bg job result: %s\n", ev.GetTextBody())
+		Noticef("bg job result: %s\n", e.GetTextBody())
 	case CHANNEL_ANSWER:
 		Noticef("call answered, starting moh")
 		con.Execute(ctx, nil, "playback", h.CallId, "local_stream://moh")
 	case CHANNEL_HANGUP:
-		cause := ev.Get("Hangup-Cause")
+		cause := e.Get("Hangup-Cause")
 		Noticef("call terminated with cause %s", cause)
 	}
 }

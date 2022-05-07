@@ -543,7 +543,7 @@ func (conn *Connection) recvEvent() (Event, error) {
 		}
 	}
 
-	e.header.Map, err = textproto.NewReader(r).ReadMIMEHeader()
+	e.header.headers, err = textproto.NewReader(r).ReadMIMEHeader()
 	if err != nil {
 		return e, err
 	}
@@ -567,7 +567,7 @@ func (conn *Connection) recvEvent() (Event, error) {
 		e.Type = EventCommandReply
 		reply := e.Get("Reply-Text")
 		if strings.Contains(reply, "%") {
-			e.header.IsEscaped = true
+			e.header.escaped = true
 		}
 	case "text/event-plain":
 		e.Type = EventGeneric
