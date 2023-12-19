@@ -1,7 +1,3 @@
-// Copyright 2022 genmzy. All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
-
 package goesl
 
 import (
@@ -14,6 +10,9 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/genmzy/goesl/ev_header"
+	"github.com/genmzy/goesl/ev_name"
 )
 
 type mimeMap struct {
@@ -29,6 +28,10 @@ func (m mimeMap) get(key string) string {
 		val, _ = url.QueryUnescape(val)
 	}
 	return val
+}
+
+func (m mimeMap) getRaw(key string) string {
+	return m.headers.Get(key)
 }
 
 func (m mimeMap) String() string {
@@ -50,11 +53,11 @@ func (t FireTime) StdTime() time.Time {
 }
 
 type Event struct {
-	Type EventType
-
 	header  mimeMap
 	body    mimeMap
 	rawBody []byte
+
+	Type EventType
 }
 
 type EventType int
@@ -67,107 +70,12 @@ const (
 	EventCommandReply
 	EventApiResponse
 	EventDisconnect
+	EventLog
 	EventGeneric
 )
 
-//go:generate enumer -type=EventName
-type EventName int
-
-const (
-	CUSTOM EventName = iota
-	CLONE
-	CHANNEL_CREATE
-	CHANNEL_DESTROY
-	CHANNEL_STATE
-	CHANNEL_CALLSTATE
-	CHANNEL_ANSWER
-	CHANNEL_HANGUP
-	CHANNEL_HANGUP_COMPLETE
-	CHANNEL_EXECUTE
-	CHANNEL_EXECUTE_COMPLETE
-	CHANNEL_HOLD
-	CHANNEL_UNHOLD
-	CHANNEL_BRIDGE
-	CHANNEL_UNBRIDGE
-	CHANNEL_PROGRESS
-	CHANNEL_PROGRESS_MEDIA
-	CHANNEL_OUTGOING
-	CHANNEL_PARK
-	CHANNEL_UNPARK
-	CHANNEL_APPLICATION
-	CHANNEL_ORIGINATE
-	CHANNEL_UUID
-	API
-	LOG
-	INBOUND_CHAN
-	OUTBOUND_CHAN
-	STARTUP
-	SHUTDOWN
-	PUBLISH
-	UNPUBLISH
-	TALK
-	NOTALK
-	SESSION_CRASH
-	MODULE_LOAD
-	MODULE_UNLOAD
-	DTMF
-	MESSAGE
-	PRESENCE_IN
-	NOTIFY_IN
-	PRESENCE_OUT
-	PRESENCE_PROBE
-	MESSAGE_WAITING
-	MESSAGE_QUERY
-	ROSTER
-	CODEC
-	BACKGROUND_JOB
-	DETECTED_SPEECH
-	DETECTED_TONE
-	PRIVATE_COMMAND
-	HEARTBEAT
-	TRAP
-	ADD_SCHEDULE
-	DEL_SCHEDULE
-	EXE_SCHEDULE
-	RE_SCHEDULE
-	RELOADXML
-	NOTIFY
-	PHONE_FEATURE
-	PHONE_FEATURE_SUBSCRIBE
-	SEND_MESSAGE
-	RECV_MESSAGE
-	REQUEST_PARAMS
-	CHANNEL_DATA
-	GENERAL
-	COMMAND
-	SESSION_HEARTBEAT
-	CLIENT_DISCONNECTED
-	SERVER_DISCONNECTED
-	SEND_INFO
-	RECV_INFO
-	RECV_RTCP_MESSAGE
-	CALL_SECURE
-	NAT
-	RECORD_START
-	RECORD_STOP
-	PLAYBACK_START
-	PLAYBACK_STOP
-	CALL_UPDATE
-	FAILURE
-	SOCKET_DATA
-	MEDIA_BUG_START
-	MEDIA_BUG_STOP
-	CONFERENCE_DATA_QUERY
-	CONFERENCE_DATA
-	CALL_SETUP_REQ
-	CALL_SETUP_RESULT
-	CALL_DETAIL
-	DEVICE_STATE
-	ALL
-)
-
 func (e Event) GetTextBody() string {
-	if e.Type == EventApiResponse {
+	if e.Type == EventApiResponse || e.Type == EventLog {
 		resp := strings.TrimSpace(string(e.rawBody))
 		return string(resp)
 	}
@@ -177,6 +85,7 @@ func (e Event) GetTextBody() string {
 	}
 	bblen, err := strconv.Atoi(slen)
 	if err != nil {
+		// FIXME: this will never be called by a replaced logger, but keep this
 		Warnf("content length parse error: %v", err)
 		return ""
 	}
@@ -187,16 +96,31 @@ func (e Event) GetTextBody() string {
 // Get retrieves the value of header from Event header or (if not found) from Event body.
 // The value is returned unescaped and is empty if not found anywhere.
 func (e Event) Get(header string) string {
-	val := e.header.get(header)
+	val := e.body.get(header)
 	if val == "" {
-		val = e.body.get(header)
+		val = e.header.get(header)
+	}
+	return val
+}
+
+func (e Event) GetRaw(header string) string {
+	val := e.body.getRaw(header)
+	if val == "" {
+		val = e.header.get(header)
 	}
 	return val
 }
 
 func (e Event) String() string {
 	body, _ := url.QueryUnescape(string(e.rawBody))
-	return fmt.Sprintf("%s\n.\n%s====================\n", e.header, body)
+	return fmt.Sprintf("%v\n.\n%v====================\n", e.header, body)
+}
+
+func (e Event) EventContent() string {
+	if e.Type == EventGeneric {
+		return string(e.rawBody)
+	}
+	return ""
 }
 
 func (e *Event) parseTextBody() error {
@@ -211,123 +135,114 @@ func (e *Event) parseTextBody() error {
 
 // --------------------- helper to event get -------------------------- //
 
-// generic event headers
-const (
-	// Core uuid
-	Core_Uuid = "Core-UUID"
-	// event innate attributions
-	Event_Name           = "Event-Name"
-	Event_Sequence       = "Event-Sequence"
-	FreeSWITCH_IPv4      = "FreeSWITCH-IPv4"
-	Event_Date_Timestamp = "Event-Date-Timestamp"
-	// background job related
-	BgJob_Uuid        = "Job-Uuid"
-	BgJob_Command     = "Job-Command"
-	BgJob_Command_Arg = "Job-Command-Arg"
-	// leg uuid
-	Unique_ID           = "Unique-ID"
-	Channel_State       = "Channel-State"
-	Call_Direction      = "Call-Direction"
-	Other_Leg_Unique_ID = "Other-Leg-Unique-ID"
-	// caller
-	Caller_ID_Number    = "Caller-Caller-ID-Number"
-	Callee_ID_Number    = "Caller-Destination-Number"
-	Caller_Network_Addr = "Caller-Network-Addr"
-	// variables
-	Sip_From_Uri = "variable_sip_from_uri"
-	// digits
-	DTMF_Digit  = "DTMF-Digit"
-	DTMF_Source = "DTMF-Source"
-	// hangup cause
-	Hangup_Cause = "Hangup-Cause"
-	// current application
-	CurrentApp     = "variable_current_application"
-	CurrentAppData = "variable_current_application_data"
-	// application
-	Application      = "Application"
-	Application_Data = "Application-Data"
-)
-
-func (e Event) Name() EventName {
-	en, err := EventNameString(e.Get(Event_Name))
+func (e Event) Name() ev_name.EventName {
+	en, err := ev_name.EventNameString(e.Get(ev_header.Event_Name))
 	if err != nil {
+		// FIXME: this will never be called by a replaced logger, but keep this
 		Warnf("parse event name error: %v", err)
-		return CUSTOM
+		return ev_name.CUSTOM
 	}
 	return en
 }
 
 func (e Event) FireTime() FireTime {
-	ft, err := strconv.ParseInt(e.Get(Event_Date_Timestamp), 10, 64)
+	ft, err := strconv.ParseInt(e.Get(ev_header.Event_Date_Timestamp), 10, 64)
 	if err != nil {
+		// FIXME: this will never be called by a replaced logger, but keep this
 		Warnf("parse fire time error: %v", err)
 		return 0
 	}
 	return FireTime(ft)
 }
 
-func (e Event) CoreUuid() string {
-	return e.Get(Core_Uuid)
+func (e Event) BgJobResponse() string {
+	return e.GetTextBody()
 }
 
-func (e Event) CallUuid() string {
-	return e.Get(Unique_ID)
+func (e Event) ErrOrRes() (raw string, err error) {
+	switch e.Type {
+	case EventCommandReply:
+		raw = e.Get("Reply-Text")
+	case EventApiResponse:
+		raw = e.GetTextBody()
+	default:
+		return
+	}
+	if len(raw) < 6 {
+		return
+	}
+	if strings.HasPrefix(raw, "-ERR ") {
+		return raw, errors.New(raw[5:])
+	}
+	return raw, nil
+}
+
+func (e Event) CoreUuid() string {
+	return e.Get(ev_header.Core_Uuid)
+}
+
+func (e Event) Uuid() string {
+	return e.Get(ev_header.Unique_ID)
 }
 
 // app and data
 func (e Event) App() (string, string) {
-	return e.Get(Application_Data), e.Get(Application_Data)
+	return e.Get(ev_header.Application_Data), e.Get(ev_header.Application_Data)
+}
+
+func (e Event) API() (string, string) {
+	return e.Get(ev_header.API_Command), e.Get(ev_header.API_Command_Argument)
 }
 
 // current app and data
 func (e Event) CurrentApp() (string, string) {
-	return e.Get(CurrentApp), e.Get(CurrentAppData)
+	return e.Get(ev_header.CurrentApp), e.Get(ev_header.CurrentAppData)
 }
 
 func (e Event) Digits() string {
-	return e.Get(DTMF_Digit)
+	return e.Get(ev_header.DTMF_Digit)
 }
 
 func (e Event) DigitsSource() string {
-	return e.Get(DTMF_Source)
+	return e.Get(ev_header.DTMF_Source)
 }
 
 func (e Event) CallDirection() string {
-	return e.Get(Call_Direction)
+	return e.Get(ev_header.Call_Direction)
 }
 
 func (e Event) Caller() string {
-	return e.Get(Caller_ID_Number)
+	return e.Get(ev_header.Caller_ID_Number)
 }
 
 func (e Event) Callee() string {
-	return e.Get(Callee_ID_Number)
+	return e.Get(ev_header.Callee_Destination_Number)
 }
 
 func (e Event) Sequence() string {
-	return e.Get(Event_Sequence)
+	return e.Get(ev_header.Event_Sequence)
 }
 
 func (e Event) SipFrom() string {
-	return e.Get(Sip_From_Uri)
+	return e.Get(ev_header.Sip_From_Host)
+}
+
+func (e Event) SipTo() string {
+	return e.Get(ev_header.Sip_To_Host)
 }
 
 func (e Event) CoreNetworkAddr() string {
-	return e.Get(Caller_Network_Addr)
+	return e.Get(ev_header.Caller_Network_Addr)
 }
 
 func (e Event) CoreIP() string {
-	return e.Get(FreeSWITCH_IPv4)
+	return e.Get(ev_header.FreeSWITCH_IPv4)
 }
 
 func (e Event) BgJob() string {
-	return e.Get(BgJob_Uuid)
+	return e.Get(ev_header.BgJob_Uuid)
 }
 
 func (e Event) BgCommand() (string, string) {
-	return e.Get(BgJob_Command), e.Get(BgJob_Command_Arg)
-}
-
-func (e Event) BgJobResponse() string {
-	return e.GetTextBody()
+	return e.Get(ev_header.BgJob_Command), e.Get(ev_header.BgJob_Command_Arg)
 }

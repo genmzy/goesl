@@ -1,7 +1,3 @@
-// Copyright 2022 genmzy. All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
-
 package goesl
 
 import (
@@ -11,10 +7,10 @@ import (
 )
 
 type Command struct {
-	Sync  bool
-	UId   string
+	Uuid  string
 	App   string
 	Args  string
+	Sync  bool
 	Loops uint
 }
 
@@ -22,7 +18,7 @@ type Command struct {
 func (cmd *Command) Serialize() []byte {
 	var buf bytes.Buffer
 	buf.WriteString("sendmsg ")
-	buf.WriteString(cmd.UId)
+	buf.WriteString(cmd.Uuid)
 	buf.WriteString("\r\ncall-command: execute")
 	buf.WriteString("\r\nexecute-app-name: ")
 	buf.WriteString(cmd.App)
@@ -43,14 +39,6 @@ func (cmd *Command) Serialize() []byte {
 
 // Execute sends Command cmd over Connection and waits for reply.
 // Returns the command reply event pointer or an error if any.
-// suggest: use RepJustCareError
-func (cmd Command) Execute(ctx context.Context, conn *Connection, h RepHandler) {
-	srh := cmdReplyHandler{
-		cmd: cmd.Serialize(),
-		rh:  h,
-	}
-	select {
-	case conn.cmdReplyHandlers <- srh:
-	case <-ctx.Done():
-	}
+func (cmd Command) Execute(ctx context.Context, conn *Connection) (string, error) {
+	return conn.SendBytes(ctx, cmd.Serialize())
 }

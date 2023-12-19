@@ -6,17 +6,16 @@ import (
 )
 
 type Options struct {
-	autoRedial   bool
-	nextDialWait func([]time.Duration) time.Duration
-	maxRetries   int
-
-	dialTimeout time.Duration
-	heartbeat   time.Duration // event heartbeat time
-	netDelay    time.Duration // event heartbeat delay, default 2 seconds
-
-	sendReplyCap int
-
-	logger Logger
+	logger         Logger
+	redialStrategy RedoStrategy
+	logOutput      io.Writer
+	logPrefix      string
+	maxRetries     int
+	dialTimeout    time.Duration
+	heartbeat      time.Duration
+	netDelay       time.Duration
+	sendReplyCap   int
+	autoRedial     bool
 }
 
 func (o *Options) apply(opts []Option) {
@@ -27,9 +26,9 @@ func (o *Options) apply(opts []Option) {
 
 func newOptions(opts []Option) *Options {
 	o := &Options{
-		autoRedial:   false,
-		nextDialWait: nil,
-		maxRetries:   -1,
+		autoRedial:     false,
+		redialStrategy: nil,
+		maxRetries:     -1,
 		// timeouts
 		dialTimeout: 3 * time.Second,
 		heartbeat:   20 * time.Second,
@@ -37,7 +36,7 @@ func newOptions(opts []Option) *Options {
 		// sender messages
 		sendReplyCap: 20,
 		// debug logger
-		logger: logger,
+		logger: defaultLogger,
 	}
 	o.apply(opts)
 	return o
@@ -48,29 +47,19 @@ type Option struct {
 }
 
 // need to pay attention that the `strategy` should handle that time.Duration is empty
-func WithAutoRedial(strategy func([]time.Duration) time.Duration) Option {
+func WithAutoRedial(strategy RedoStrategy) Option {
 	return Option{
 		f: func(o *Options) {
 			o.autoRedial = true
-			o.nextDialWait = strategy
+			o.redialStrategy = strategy
 		},
 	}
 }
 
-// 1, 2, 4, 8, 16, 16, ...
-func defaultRedialWait(old []time.Duration) (next time.Duration) {
-	if len(old) == 0 {
-		return 1 * time.Second
-	}
-	curSec := int(old[len(old)-1] / time.Second)
-	if curSec < 16 {
-		return time.Duration(curSec*2) * time.Second
-	}
-	return 16 * time.Second
-}
-
 func WithDefaultAutoRedial() Option {
-	return WithAutoRedial(defaultRedialWait)
+	return WithAutoRedial(&defaultRedoStrategy{
+		redoWaited: make([]time.Duration, 0),
+	})
 }
 
 func WithLogger(logger Logger) Option {
@@ -107,7 +96,7 @@ func WithHeartBeat(t time.Duration) Option {
 }
 
 // Set max network delay time duration
-// used as connection write timeout, send-reply ticker timeout
+// used as connection write timeout, event callback ticker timeout
 // suggest range:       1*time.Second <= t <= 5*time.Second
 // valid range: 100*time.Milliseconds <= t <= 10*time.Second
 func WithNetDelay(t time.Duration) Option {
@@ -137,10 +126,10 @@ func WithSendReplyCap(n int) Option {
 func WithLogLevel(lv Level) Option {
 	return Option{
 		f: func(o *Options) {
-			if o.logger != logger {
+			if o.logger != defaultLogger {
 				return
 			}
-			logger.level = lv
+			defaultLogger.level = lv
 		},
 	}
 }
@@ -150,10 +139,10 @@ func WithLogLevel(lv Level) Option {
 func WithLogOutput(w io.Writer) Option {
 	return Option{
 		f: func(o *Options) {
-			if o.logger != logger {
+			if o.logger != defaultLogger {
 				return
 			}
-			logger.SetOutput(w)
+			o.logOutput = w
 		},
 	}
 }
@@ -161,10 +150,10 @@ func WithLogOutput(w io.Writer) Option {
 func WithLogPrefix(s string) Option {
 	return Option{
 		f: func(o *Options) {
-			if o.logger != logger {
+			if o.logger != defaultLogger {
 				return
 			}
-			logger.SetPrefix(s)
+			o.logPrefix = s
 		},
 	}
 }

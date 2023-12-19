@@ -1,7 +1,3 @@
-// Copyright 2022 genmzy. All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
-
 package goesl
 
 import (
@@ -20,6 +16,8 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/genmzy/goesl/ev_name"
+
 	"github.com/google/uuid"
 )
 
@@ -27,67 +25,66 @@ type ConnHandler interface {
 	OnConnect(*Connection)
 	OnDisconnect(*Connection, Event)
 	OnEvent(context.Context, *Connection, Event)
+	OnFslog(context.Context, *Connection, Fslog)
 	OnClose(*Connection)
 }
 
 type Connection struct {
-	// replaced when reset
-	c         net.Conn
-	waitings  []time.Duration //  all old waitings
-	closeOnce *sync.Once      //  use pointer so that can be reset
-	connected bool
-	buffer    *bufio.ReadWriter
+	// reset when connection auto redial
+	Handler            ConnHandler
+	c                  net.Conn
+	connected          bool
+	closeOnce          *sync.Once
+	buffer             *bufio.ReadWriter
+	evCallbackCanceler func()
+
+	// avoid write in one goroutine and flush in another goroutine, which names `short write` error
+	writeLock *sync.Mutex
+	srWg      sync.WaitGroup
+
+	cmdReply chan Event // channel to wait command send reply
+	apiResp  chan Event // channel to wait api command send response
+	events   chan Event // channel to send plain events
 
 	opts *Options
 
-	cmdReply chan Event
-	apiResp  chan Event
-	Handler  ConnHandler
 	Address  string
 	Password string
-
-	srWg     sync.WaitGroup
-	srCancel func()
-	srTicker *time.Ticker
-	// channel between send-reply and handle-events
-	cmdReplyHandlers chan cmdReplyHandler
 }
 
+// `retry` just a flag to indicate that if this is a retry dial
 func (conn *Connection) dialTimes(retry bool) (err error) {
 	if !retry {
 		conn.c, err = net.DialTimeout("tcp", conn.Address, conn.opts.dialTimeout)
-		return err
+		return
 	}
 	for i := 0; i <= conn.opts.maxRetries || conn.opts.maxRetries < 0; i++ {
-		next := conn.opts.nextDialWait(conn.waitings)
-		conn.waitings = append(conn.waitings, next)
-		if len(conn.waitings) >= 2 {
-			sleep := conn.waitings[len(conn.waitings)-2]
-			conn.opts.logger.Warnf("connect failed, will retry in %v", sleep)
-			time.Sleep(sleep)
-		}
 		conn.opts.logger.Debugf("start dial with timeout: %s", conn.opts.dialTimeout)
 		conn.c, err = net.DialTimeout("tcp", conn.Address, conn.opts.dialTimeout)
 		if err == nil {
-			conn.waitings = conn.waitings[:0]
-			break
+			if i > 0 {
+				conn.opts.redialStrategy.Reset()
+			}
+			return
 		}
+		next := conn.opts.redialStrategy.NextRedoWait()
+		conn.opts.logger.Warnf("connect failed, will retry in %v", next)
+		time.Sleep(next)
 	}
 	return
 }
 
 // reset all conn-related things
-// if err is nil, that means dial first time
-func (conn *Connection) reset(err error) error {
-	if err == nil {
-		conn.opts.logger.Infof("new connection dial connection %s start...",
-			conn.Address)
+// if parameter `former` is nil, that means dial first time
+func (conn *Connection) reset(former error) error {
+	if former == nil {
+		conn.opts.logger.Infof("new connection dial %s start...", conn.Address)
 	}
-	if errors.Is(err, net.ErrClosed) || errors.Is(err, context.Canceled) {
-		return fmt.Errorf("former error %v, should exit...", err)
+	if errors.Is(former, net.ErrClosed) || errors.Is(former, context.Canceled) {
+		return fmt.Errorf("former error: %v", former)
 	}
 	retry := false
-	if err != nil {
+	if former != nil {
 		retry = true
 		conn.Close()
 	}
@@ -103,105 +100,40 @@ func (conn *Connection) reset(err error) error {
 		return err
 	}
 
-	// create a send-reply goroutine
+	// create a event callback goroutine
 	conn.srWg.Add(1)
 	ctx, cancel := context.WithCancel(context.Background())
-	conn.srCancel = cancel
-	go conn.sendReply(ctx)
-
-	if conn.opts.autoRedial {
-		conn.MustSendOK(ctx, "event", "plain", HEARTBEAT.String())
-	}
-
-	conn.Handler.OnConnect(conn)
+	conn.evCallbackCanceler = cancel
+	go conn.eventCallback(ctx)
 
 	return nil
 }
 
-func emptyTickerChan(ticker *time.Ticker) {
-	// loop seems uncessary, but still keep that
-	for {
-		select {
-		case <-ticker.C:
-		default:
-			return
-		}
+func (conn *Connection) eventCallback(ctx context.Context) {
+	if conn.opts.autoRedial {
+		conn.Plain(ctx, []ev_name.EventName{ev_name.HEARTBEAT}, nil)
 	}
-}
+	conn.Handler.OnConnect(conn)
 
-// goroutine send-reply to send command and receive reply/response
-func (conn *Connection) sendReply(ctx context.Context) {
 	defer conn.srWg.Done()
+forloop:
 	for {
-		var crh cmdReplyHandler
+		var ev Event
 		select {
 		case <-ctx.Done():
-			conn.opts.logger.Noticef("send-reply of %s cancel with error: %v\n",
+			conn.opts.logger.Noticef("event callback of %s cancel with error: %v\n",
 				conn.Address, ctx.Err())
-			return
-		case crh = <-conn.cmdReplyHandlers:
+			break forloop
+		case ev = <-conn.events:
 		}
-
-		if err := conn.c.SetWriteDeadline(time.Now().Add(conn.opts.netDelay)); err != nil {
-			// conn is closing or deadline is 0
-			conn.opts.logger.Errorf("set write deadline: %v", err)
-		}
-
-		// NOTE: if arrive write deadline, socket may already write some bytes
-		_, err := conn.write(crh.cmd)
-		if err != nil {
-			// cannot detect write timeout, write will not waiting for tcp ACK
-			if lost, _ := connLost(err, 'w'); lost {
-				conn.opts.logger.Errorf("write error, send-reply exiting with err: %v", err)
-				goto connLossAccident
-			}
-			// TODO: need to be tested <2022-04-25, genmzy> //
-			conn.opts.logger.Warnf("write error: %v, continuing...", err)
-			continue
-		}
-
-		// empty ticker channel to avoid former arrived ticks
-		emptyTickerChan(conn.srTicker)
-
-		var ev Event
-		ivals := 0
-	waitForReply:
-		for {
-			select {
-			case <-ctx.Done():
-				conn.opts.logger.Noticef("send-reply of %s cancel with error: %v\n", conn.Address, ctx.Err())
-				return
-			case ev = <-conn.cmdReply:
-				break waitForReply
-			case ev = <-conn.apiResp:
-				break waitForReply
-			case <-conn.srTicker.C:
-				// NOTE: 2 times ticker receive here for keeping at least 1 net delay interval
-				if ivals >= 2 {
-					conn.opts.logger.Debugf("receive 2 intervals, jumping to connLossAccident...")
-					goto connLossAccident
-				}
-				ivals++
-			}
-		}
-		if crh.rh != nil {
-			crh.rh(ev, err)
-		}
+		conn.Handler.OnEvent(ctx, conn, ev)
 	}
-
-connLossAccident:
-	conn.opts.logger.Debugf("reach connection loss accident")
-	// cancel read immediately, use any time.Time before or equals current time
-	// conn.c.SetReadDeadline(time.Now()) will make one more system call (?)
-	err := conn.c.SetReadDeadline(time.Unix(0, 0))
-	if err != nil {
-		conn.opts.logger.Errorf("set read deadline: %v", err)
-	}
-	return
+	conn.opts.logger.Noticef("listen events of %s cancel with error: %v\n",
+		conn.Address, ctx.Err())
 }
 
 // Create a new event socket connection and take a ConnectionHandler interface.
-// This will create a new 'send-reply' goroutine this goroutine will exit when call
+// This will create a new 'event callback' goroutine this goroutine will exit when call
 // goesl.*Connection.Close()
 func Dial(addr, passwd string, handler ConnHandler, options ...Option) (*Connection, error) {
 	conn := Connection{
@@ -210,12 +142,20 @@ func Dial(addr, passwd string, handler ConnHandler, options ...Option) (*Connect
 		Handler:  handler,
 	}
 	conn.opts = newOptions(options)
-	conn.waitings = make([]time.Duration, 0, conn.opts.maxRetries+1)
 
 	conn.cmdReply = make(chan Event, conn.opts.sendReplyCap)
 	conn.apiResp = make(chan Event, conn.opts.sendReplyCap)
-	conn.cmdReplyHandlers = make(chan cmdReplyHandler, conn.opts.sendReplyCap)
-	conn.srTicker = time.NewTicker(conn.opts.netDelay)
+	conn.events = make(chan Event, conn.opts.sendReplyCap)
+	conn.writeLock = &sync.Mutex{}
+
+	// NOTE: only for default logger and
+	// should set output first to clear if prefix should be colored
+	if conn.opts.logOutput != nil {
+		defaultLogger.setOutput(conn.opts.logOutput)
+	}
+	if conn.opts.logPrefix != "" {
+		defaultLogger.setPrefix(conn.opts.logPrefix)
+	}
 
 	// do connect
 	err := conn.reset(nil)
@@ -227,139 +167,163 @@ func Dial(addr, passwd string, handler ConnHandler, options ...Option) (*Connect
 }
 
 // Send to FreeSWITCH and handle result(error and event)
-func (conn *Connection) Send(ctx context.Context, h RepHandler, cmd string, args ...string) {
+func (conn *Connection) Send(ctx context.Context, cmd string, args ...string) (string, error) {
 	buf := bytes.NewBufferString(cmd)
 	for _, arg := range args {
 		buf.WriteString(" ")
 		buf.WriteString(arg)
 	}
 	buf.WriteString("\r\n\r\n")
-	crh := cmdReplyHandler{
-		cmd: buf.Bytes(),
-		rh:  h,
+	if err := conn.c.SetWriteDeadline(time.Now().Add(conn.opts.netDelay)); err != nil {
+		// conn is closing or deadline is 0
+		conn.opts.logger.Errorf("set write deadline: %v", err)
 	}
+	return conn.SendBytes(ctx, buf.Bytes())
+}
+
+func (conn *Connection) SendBytes(ctx context.Context, buf []byte) (string, error) {
+	_, err := conn.write(buf)
+	if err != nil {
+		// cannot detect write timeout, write will not waiting for tcp ACK
+		if lost, _ := connLost(err, 'w'); lost {
+			conn.opts.logger.Errorf("write error, event callback exiting with err: %v", err)
+			// cancel read immediately, use any time.Time before or equals current time
+			// conn.c.SetReadDeadline(time.Now()) will make one more system call
+			err = conn.c.SetReadDeadline(time.Unix(0, 0))
+			if err != nil {
+				conn.opts.logger.Errorf("set read deadline: %v", err)
+			}
+		} else {
+			conn.opts.logger.Warnf("write error: %v, continuing...", err)
+		}
+		return "", err
+	}
+	var ev Event
 	select {
-	case conn.cmdReplyHandlers <- crh:
 	case <-ctx.Done():
+		return "", ctx.Err()
+	case ev = <-conn.cmdReply:
+	case ev = <-conn.apiResp:
 	}
+	return ev.ErrOrRes()
 }
 
 // must send and receive command, or fatal the process
 func (conn *Connection) MustSendOK(ctx context.Context, cmd string, args ...string) {
-	f := func(err error) {
-		if err == nil {
-			return
-		}
-		conn.opts.logger.Fatalf(
-			fmt.Sprintf("with cmd: %s(%v) error: %v\n",
-				cmd, args, err,
-			),
-		)
+	_, err := conn.Send(ctx, cmd, args...)
+	if err != nil {
+		conn.opts.logger.Fatalf("with cmd: %s(%v) error: %v\n", cmd, args, err)
 	}
-	s := RepJustCareError{
-		CHandle: f,
-		RHandle: f,
+}
+
+func (conn *Connection) Plain(ctx context.Context, ens []ev_name.EventName, subs []string) {
+	strs := make([]string, 0)
+	strs = append(strs, "plain")
+	for _, en := range ens {
+		// enStrs = append(enStrs, en.String())
+		strs = append(strs, en.String())
 	}
-	conn.Send(ctx, s.RepHandle, cmd, args...)
+	if len(subs) != 0 {
+		strs = append(strs, ev_name.CUSTOM.String())
+	}
+	strs = append(strs, subs...)
+	conn.MustSendOK(ctx, "event", strs...)
+}
+
+func (conn *Connection) Fslog(ctx context.Context, lv FslogLevel) {
+	conn.MustSendOK(ctx, "log", lv.String())
 }
 
 // Send event to FreeSWITCH, this is NOT a API or BgAPI command
 // suggest: use RepJustCareError
-func (conn *Connection) SendEvent(ctx context.Context, h RepHandler, evName string,
-	headers map[string]string, body []byte) {
+func (conn *Connection) SendEvent(ctx context.Context, en ev_name.EventName, headers map[string]string, body []byte) error {
 	buf := bytes.NewBufferString("sendevent ")
-	buf.WriteString(evName)
+	buf.WriteString(en.String())
 	buf.WriteString("\r\n")
 	for k, v := range headers {
-		buf.WriteString(fmt.Sprintf("%s: %s\r\n", k, v))
+		fmt.Fprintf(buf, "%s: %s\r\n", k, v)
 	}
-	buf.WriteString(fmt.Sprintf("Content-Length: %d\r\n\r\n", len(body)))
+	fmt.Fprintf(buf, "Content-Length: %d\r\n\r\n", len(body))
 	buf.Write(body)
-
-	crh := cmdReplyHandler{
-		cmd: buf.Bytes(),
-		rh:  h,
-	}
-	select {
-	case conn.cmdReplyHandlers <- crh:
-	case <-ctx.Done():
-	}
+	_, err := conn.SendBytes(ctx, buf.Bytes())
+	return err
 }
 
 // Send API command to FreeSWITCH by event socket, already start with `api `
-// get result in param `h` by calling method, esl.Event.GetTextBody(), result maybe start withh `-ERR `
-func (conn *Connection) Api(ctx context.Context, h RepHandler, cmd string, args ...string) {
+// get result in param `h` by calling method, esl.Event.GetTextBody(), result maybe start withh `-ERR `.
+// NOTE: do not use block API such as orignate here, which will block fs from sending other events(e.g.
+// HEARTBEAT, further make esl client automatic redial), so use (*Connection).BgApi
+func (conn *Connection) Api(ctx context.Context, cmd string, args ...string) (string, error) {
 	cmd = fmt.Sprintf("api %s", cmd)
-	conn.Send(ctx, h, cmd, args...)
+	return conn.Send(ctx, cmd, args...)
 }
 
 // `bgapi` command will never response error, so just care Connection error handle
 // This is a better way to use `api bgapi uuid:xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx` instead of `bgapi `
 // and wait for job uuid
-func (conn *Connection) BgApi(ctx context.Context, h ConnErrHandler, cmd string, args ...string) string {
+func (conn *Connection) BgApi(ctx context.Context, cmd string, args ...string) (string, error) {
 	bgJob := uuid.New().String()
 	cmd = fmt.Sprintf("api bgapi uuid:%s %s", bgJob, cmd)
-	r := RepBgUuid{CHandle: h}
-	conn.Send(ctx, r.RepHandle, cmd, args...)
-	return bgJob
+	_, err := conn.Send(ctx, cmd, args...)
+	return bgJob, err
 }
 
 // Execute an app on leg `uuid` and for `loops` times
 // suggest: use RepJustCareError
-func (conn *Connection) ExecuteLooped(ctx context.Context, h RepHandler, app string, uuid string,
-	loops uint, params ...string) {
+func (conn *Connection) ExecuteLooped(ctx context.Context, app string, uuid string, loops uint, params ...string) (string, error) {
 	args := strings.Join(params, " ")
 	cmd := Command{
 		Sync:  false,
-		UId:   uuid,
+		Uuid:  uuid,
 		App:   app,
 		Args:  args,
 		Loops: loops,
 	}
-	cmd.Execute(ctx, conn, h)
+	return cmd.Execute(ctx, conn)
 }
 
 // Execute an app on leg `uuid` and for `loops` times, this app will not be interrupted util finish.
 // suggest: use RepJustCareError
-func (conn *Connection) ExecuteLoopedSync(ctx context.Context, h RepHandler, app string, uuid string,
-	loops uint, params ...string) {
+func (conn *Connection) ExecuteLoopedSync(ctx context.Context, app string, uuid string,
+	loops uint, params ...string,
+) (string, error) {
 	args := strings.Join(params, " ")
 	cmd := Command{
 		Sync:  true,
-		UId:   uuid,
+		Uuid:  uuid,
 		App:   app,
 		Args:  args,
 		Loops: loops,
 	}
-	cmd.Execute(ctx, conn, h)
+	return cmd.Execute(ctx, conn)
 }
 
 // Execute an app on leg `uuid`
 // suggest: use RepJustCareError
-func (conn *Connection) Execute(ctx context.Context, h RepHandler, app string, uuid string, params ...string) {
+func (conn *Connection) Execute(ctx context.Context, app string, uuid string, params ...string) (string, error) {
 	args := strings.Join(params, " ")
 	cmd := Command{
 		Sync:  false,
-		UId:   uuid,
+		Uuid:  uuid,
 		App:   app,
 		Args:  args,
 		Loops: 1,
 	}
-	cmd.Execute(ctx, conn, h)
+	return cmd.Execute(ctx, conn)
 }
 
 // Execute an app on leg `uuid`, this app will not be interrupted util finish.
 // suggest: use RepJustCareError
-func (conn *Connection) ExecuteSync(ctx context.Context, h RepHandler, app string, uuid string, params ...string) {
+func (conn *Connection) ExecuteSync(ctx context.Context, app string, uuid string, params ...string) (string, error) {
 	args := strings.Join(params, " ")
 	cmd := Command{
 		Sync:  true,
-		UId:   uuid,
+		Uuid:  uuid,
 		App:   app,
 		Args:  args,
 		Loops: 1,
 	}
-	cmd.Execute(ctx, conn, h)
+	return cmd.Execute(ctx, conn)
 }
 
 func (conn *Connection) makeBlock() {
@@ -445,13 +409,13 @@ func connLost(err error, mode byte) (bool, bool) {
 // `errors.Is(err, net.ErrClosed) || errors.Is(err, context.Canceled)`
 func (conn *Connection) HandleEvents(ctx context.Context) error {
 	defer func() {
-		conn.opts.logger.Noticef("waiting for send-reply exiting...")
+		conn.opts.logger.Noticef("waiting for event callback goroutine exiting...")
 		if !conn.opts.autoRedial && conn.connected { // this is a timeout exception
-			conn.opts.logger.Infof("connection disable automatic redial, so call send-reply cancel function.")
-			conn.srCancel()
+			conn.opts.logger.Infof("connection disable automatic redial, so execute event callback canceler.")
+			conn.evCallbackCanceler()
 		}
 		conn.srWg.Wait()
-		conn.opts.logger.Noticef("waiting for send-reply exiting done.")
+		conn.opts.logger.Noticef("waiting for event callback exiting done.")
 	}()
 	for conn.connected {
 		select {
@@ -470,7 +434,7 @@ func (conn *Connection) HandleEvents(ctx context.Context) error {
 				}
 				return err
 			}
-			conn.opts.logger.Warnf("recvEvent: %v, continuing...", err)
+			conn.opts.logger.Warnf("receive event: %v, continuing ...", err)
 			continue
 		}
 		switch ev.Type {
@@ -491,17 +455,29 @@ func (conn *Connection) HandleEvents(ctx context.Context) error {
 				return ctx.Err()
 			}
 		case EventGeneric:
-			conn.Handler.OnEvent(ctx, conn, ev)
+			conn.events <- ev
+		case EventLog:
+			fslog, err := Event2Fslog(ev)
+			if err != nil {
+				conn.opts.logger.Errorf("log event convert: %v", err)
+				continue
+			}
+			conn.Handler.OnFslog(ctx, conn, fslog)
 		}
 	}
 	return fmt.Errorf("disconnected")
 }
 
-// NOTE: an error impletion:
-//    defer conn.buffer.Flush()
-//    return conn.buffer.Write()
+// NOTE: an error implementation:
+//
+// defer conn.buffer.Flush()
+// return conn.buffer.Write()
+//
 // this will ignore the real connection write error that in `Flush`
 func (conn *Connection) write(b []byte) (int, error) {
+	// conn.opts.logger.Noticef("write: %s", string(b))
+	conn.writeLock.Lock()
+	defer conn.writeLock.Unlock()
 	n, err := conn.buffer.Write(b)
 	if err != nil {
 		return n, err
@@ -510,7 +486,7 @@ func (conn *Connection) write(b []byte) (int, error) {
 	return n, err
 }
 
-// Close the connection and make send-reply exit as soon as possible
+// Close the connection and make event callback exit as soon as possible
 // ignore all errors here because may the connection already lost
 //
 // Close is protected by sync.Once, so you can call this for twice or more
@@ -520,7 +496,7 @@ func (conn *Connection) Close() {
 			conn.connected = false
 			conn.Handler.OnClose(conn)
 		}
-		conn.srCancel() // close send-reply goroutine
+		conn.evCallbackCanceler() // make event callback goroutine exit
 		// cancel write immediately, use any time.Time before or equals current time
 		// conn.c.SetReadDeadline(time.Now()) will make one more system call (?)
 		conn.c.SetDeadline(time.Unix(0, 0))
@@ -545,15 +521,16 @@ func (conn *Connection) recvEvent() (Event, error) {
 
 	e.header.headers, err = textproto.NewReader(r).ReadMIMEHeader()
 	if err != nil {
+		conn.opts.logger.Debugf("read deadline arrived: %v...", errors.Is(err, os.ErrDeadlineExceeded))
 		return e, err
 	}
 
 	if slen := e.Get("Content-Length"); slen != "" {
-		len, err := strconv.Atoi(slen)
+		l, err := strconv.Atoi(slen)
 		if err != nil {
 			return e, fmt.Errorf("convert content-length %s: %v", slen, err)
 		}
-		e.rawBody = make([]byte, len)
+		e.rawBody = make([]byte, l)
 		_, err = io.ReadFull(r, e.rawBody)
 		if err != nil {
 			return e, fmt.Errorf("read body: %v", err)
@@ -578,8 +555,11 @@ func (conn *Connection) recvEvent() (Event, error) {
 		e.Type = EventDisconnect
 	case "api/response":
 		e.Type = EventApiResponse
+	case "log/data":
+		e.Type = EventLog
 	default:
 		e.Type = EventInvalid
 	}
+	// conn.opts.logger.Noticef("recvEvent: %v", e)
 	return e, err
 }
