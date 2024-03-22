@@ -81,7 +81,7 @@ func (conn *Connection) reset(former error) error {
 		conn.opts.logger.Infof("new connection dial %s start...", conn.Address)
 	}
 	if errors.Is(former, net.ErrClosed) || errors.Is(former, context.Canceled) {
-		return fmt.Errorf("former error: %v", former)
+		return fmt.Errorf("former error: %w", former)
 	}
 	retry := false
 	if former != nil {
@@ -111,7 +111,7 @@ func (conn *Connection) reset(former error) error {
 
 func (conn *Connection) eventCallback(ctx context.Context) {
 	if conn.opts.autoRedial {
-		conn.Plain(ctx, []ev_name.EventName{ev_name.HEARTBEAT}, nil)
+		conn.plain(ctx, ev_name.HEARTBEAT.String())
 	}
 	conn.Handler.OnConnect(conn)
 
@@ -166,7 +166,8 @@ func Dial(addr, passwd string, handler ConnHandler, options ...Option) (*Connect
 	return &conn, nil
 }
 
-// Send to FreeSWITCH and handle result(error and event)
+// Send command to FreeSWITCH command, this is a low-level method, suggest use
+// *Connection.Api() and *Connection.BgApi() and *Connection.Plain() instead
 func (conn *Connection) Send(ctx context.Context, cmd string, args ...string) (string, error) {
 	buf := bytes.NewBufferString(cmd)
 	for _, arg := range args {
@@ -185,7 +186,7 @@ func (conn *Connection) SendBytes(ctx context.Context, buf []byte) (string, erro
 	_, err := conn.write(buf)
 	if err != nil {
 		// cannot detect write timeout, write will not waiting for tcp ACK
-		if lost, _ := connLost(err, 'w'); lost {
+		if connLost(err, 'w') {
 			conn.opts.logger.Errorf("write error, event callback exiting with err: %v", err)
 			// cancel read immediately, use any time.Time before or equals current time
 			// conn.c.SetReadDeadline(time.Now()) will make one more system call
@@ -208,7 +209,7 @@ func (conn *Connection) SendBytes(ctx context.Context, buf []byte) (string, erro
 	return ev.ErrOrRes()
 }
 
-// must send and receive command, or fatal the process
+// Must send and receive command successfully, or fatal
 func (conn *Connection) MustSendOK(ctx context.Context, cmd string, args ...string) {
 	_, err := conn.Send(ctx, cmd, args...)
 	if err != nil {
@@ -216,26 +217,25 @@ func (conn *Connection) MustSendOK(ctx context.Context, cmd string, args ...stri
 	}
 }
 
+func (conn *Connection) plain(ctx context.Context, strs ...string) {
+	strs = append([]string{"plain"}, strs...)
+	conn.MustSendOK(ctx, "event", strs...)
+}
+
+// Plain events
 func (conn *Connection) Plain(ctx context.Context, ens []ev_name.EventName, subs []string) {
 	strs := make([]string, 0)
-	strs = append(strs, "plain")
 	for _, en := range ens {
-		// enStrs = append(enStrs, en.String())
 		strs = append(strs, en.String())
 	}
-	if len(subs) != 0 {
-		strs = append(strs, ev_name.CUSTOM.String())
-	}
-	strs = append(strs, subs...)
-	conn.MustSendOK(ctx, "event", strs...)
+	conn.plain(ctx, strs...)
 }
 
 func (conn *Connection) Fslog(ctx context.Context, lv FslogLevel) {
 	conn.MustSendOK(ctx, "log", lv.String())
 }
 
-// Send event to FreeSWITCH, this is NOT a API or BgAPI command
-// suggest: use RepJustCareError
+// Send event to FreeSWITCH, this is NOT an API or background API command
 func (conn *Connection) SendEvent(ctx context.Context, en ev_name.EventName, headers map[string]string, body []byte) error {
 	buf := bytes.NewBufferString("sendevent ")
 	buf.WriteString(en.String())
@@ -250,7 +250,6 @@ func (conn *Connection) SendEvent(ctx context.Context, en ev_name.EventName, hea
 }
 
 // Send API command to FreeSWITCH by event socket, already start with `api `
-// get result in param `h` by calling method, esl.Event.GetTextBody(), result maybe start withh `-ERR `.
 // NOTE: do not use block API such as orignate here, which will block fs from sending other events(e.g.
 // HEARTBEAT, further make esl client automatic redial), so use (*Connection).BgApi
 func (conn *Connection) Api(ctx context.Context, cmd string, args ...string) (string, error) {
@@ -269,7 +268,6 @@ func (conn *Connection) BgApi(ctx context.Context, cmd string, args ...string) (
 }
 
 // Execute an app on leg `uuid` and for `loops` times
-// suggest: use RepJustCareError
 func (conn *Connection) ExecuteLooped(ctx context.Context, app string, uuid string, loops uint, params ...string) (string, error) {
 	args := strings.Join(params, " ")
 	cmd := Command{
@@ -283,7 +281,6 @@ func (conn *Connection) ExecuteLooped(ctx context.Context, app string, uuid stri
 }
 
 // Execute an app on leg `uuid` and for `loops` times, this app will not be interrupted util finish.
-// suggest: use RepJustCareError
 func (conn *Connection) ExecuteLoopedSync(ctx context.Context, app string, uuid string,
 	loops uint, params ...string,
 ) (string, error) {
@@ -299,7 +296,6 @@ func (conn *Connection) ExecuteLoopedSync(ctx context.Context, app string, uuid 
 }
 
 // Execute an app on leg `uuid`
-// suggest: use RepJustCareError
 func (conn *Connection) Execute(ctx context.Context, app string, uuid string, params ...string) (string, error) {
 	args := strings.Join(params, " ")
 	cmd := Command{
@@ -313,7 +309,6 @@ func (conn *Connection) Execute(ctx context.Context, app string, uuid string, pa
 }
 
 // Execute an app on leg `uuid`, this app will not be interrupted util finish.
-// suggest: use RepJustCareError
 func (conn *Connection) ExecuteSync(ctx context.Context, app string, uuid string, params ...string) (string, error) {
 	args := strings.Join(params, " ")
 	cmd := Command{
@@ -326,7 +321,7 @@ func (conn *Connection) ExecuteSync(ctx context.Context, app string, uuid string
 	return cmd.Execute(ctx, conn)
 }
 
-func (conn *Connection) makeBlock() {
+func (conn *Connection) block() {
 	conn.opts.logger.Debugf("set connection %s to block", conn.Address)
 	conn.c.SetDeadline(time.Time{})
 }
@@ -339,7 +334,7 @@ func (conn *Connection) auth() error {
 		if ev.Type != EventAuth {
 			return fmt.Errorf("bad auth preamble: [%s]", ev.header)
 		}
-		return fmt.Errorf("socket read error: %v", err)
+		return fmt.Errorf("socket read error: %w", err)
 	}
 
 	var buf bytes.Buffer
@@ -349,18 +344,18 @@ func (conn *Connection) auth() error {
 
 	conn.opts.logger.Debugf("set auth deadline for dial timeout %v", conn.opts.dialTimeout)
 	if err := conn.c.SetDeadline(time.Now().Add(conn.opts.dialTimeout)); err != nil {
-		return fmt.Errorf("set deadline after %v: %v", conn.opts.dialTimeout, err)
+		return fmt.Errorf("set deadline after %v: %w", conn.opts.dialTimeout, err)
 	}
-	defer conn.makeBlock()
+	defer conn.block()
 	if _, err := conn.write(buf.Bytes()); err != nil {
 		conn.c.Close()
-		return fmt.Errorf("passwd buffer flush: %v", err)
+		return fmt.Errorf("passwd buffer flush: %w", err)
 	}
 
 	ev, err = conn.recvEvent()
 	if err != nil {
 		conn.c.Close()
-		return fmt.Errorf("auth reply: %v", err)
+		return fmt.Errorf("auth reply: %w", err)
 	}
 	if ev.Type != EventCommandReply {
 		conn.c.Close()
@@ -372,35 +367,26 @@ func (conn *Connection) auth() error {
 	return nil
 }
 
-// return value: { is_connection_error, is_connection_error_by_accident }
-// never { false, true }
-func connLost(err error, mode byte) (bool, bool) {
-	switch mode {
-	case 'r': // read
-		if errors.Is(err, os.ErrDeadlineExceeded) {
-			return true, true
-		}
-		if errors.Is(err, io.EOF) {
-			return true, true
-		}
-		if errors.Is(err, io.ErrUnexpectedEOF) {
-			return true, true
-		}
-		if errors.Is(err, net.ErrClosed) {
-			return true, false
-		}
-	case 'w': // write
-		if errors.Is(err, os.ErrDeadlineExceeded) {
-			return true, true
-		}
-		if errors.Is(err, syscall.EPIPE) {
-			return true, true
-		}
-		if errors.Is(err, net.ErrClosed) {
-			return true, false
+func connLost(err error, mode byte) bool {
+	errMap := map[byte][]error{
+		'r': {
+			os.ErrDeadlineExceeded,
+			io.EOF,
+			io.ErrUnexpectedEOF,
+			net.ErrClosed,
+		},
+		'w': {
+			os.ErrDeadlineExceeded,
+			syscall.EPIPE,
+			net.ErrClosed,
+		},
+	}
+	for _, v := range errMap[mode] {
+		if errors.Is(err, v) {
+			return true
 		}
 	}
-	return false, false
+	return false
 }
 
 // Receive events and handle them by `goesl.ConnectionHandler`
@@ -425,14 +411,17 @@ func (conn *Connection) HandleEvents(ctx context.Context) error {
 		}
 		ev, err := conn.recvEvent()
 		if err != nil {
-			if lost, accident := connLost(err, 'r'); lost {
-				if conn.opts.autoRedial && accident {
+			if connLost(err, 'r') {
+				if conn.opts.autoRedial && conn.connected { // auto redial and not be closed manually
+					conn.connected = false
 					if err := conn.reset(err); err != nil {
 						return err
 					}
 					continue
 				}
-				return err
+				// NOTE: closed manually, so use context error instead of
+				// I/O timeout no matter ctx.Err() is nil or not
+				return ctx.Err()
 			}
 			conn.opts.logger.Warnf("receive event: %v, continuing ...", err)
 			continue
@@ -500,6 +489,7 @@ func (conn *Connection) Close() {
 		// cancel write immediately, use any time.Time before or equals current time
 		// conn.c.SetReadDeadline(time.Now()) will make one more system call (?)
 		conn.c.SetDeadline(time.Unix(0, 0))
+		time.Sleep(20 * time.Millisecond)
 		conn.c.Close()
 	})
 }
@@ -521,19 +511,23 @@ func (conn *Connection) recvEvent() (Event, error) {
 
 	e.header.headers, err = textproto.NewReader(r).ReadMIMEHeader()
 	if err != nil {
-		conn.opts.logger.Debugf("read deadline arrived: %v...", errors.Is(err, os.ErrDeadlineExceeded))
+		deadline := errors.Is(err, os.ErrDeadlineExceeded)
+		conn.opts.logger.Debugf("read deadline arrived: %v...", deadline)
+		if !deadline {
+			conn.opts.logger.Debugf("read mime header: %v", err)
+		}
 		return e, err
 	}
 
 	if slen := e.Get("Content-Length"); slen != "" {
 		l, err := strconv.Atoi(slen)
 		if err != nil {
-			return e, fmt.Errorf("convert content-length %s: %v", slen, err)
+			return e, fmt.Errorf("convert content-length %s: %w", slen, err)
 		}
 		e.rawBody = make([]byte, l)
 		_, err = io.ReadFull(r, e.rawBody)
 		if err != nil {
-			return e, fmt.Errorf("read body: %v", err)
+			return e, fmt.Errorf("read body: %w", err)
 		}
 	}
 

@@ -127,7 +127,7 @@ func (e *Event) parseTextBody() error {
 	var err error
 	buf := bufio.NewReader(bytes.NewReader(e.rawBody))
 	if e.body.headers, err = textproto.NewReader(buf).ReadMIMEHeader(); err != nil {
-		return fmt.Errorf("parse text body: %v", err)
+		return fmt.Errorf("parse text body: %w", err)
 	}
 	e.body.escaped = true // all generic events are regard as escaped
 	return err

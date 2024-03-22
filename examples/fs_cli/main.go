@@ -16,15 +16,9 @@ import (
 	"time"
 
 	"github.com/genmzy/goesl"
-	"github.com/genmzy/goesl/ev_header"
-	"github.com/genmzy/goesl/ev_name"
 )
 
-type Handler struct {
-	// just test
-	CallId  string
-	BgJobId string
-}
+type Handler struct{}
 
 var (
 	host    = flag.String("H", "127.0.0.1", "Specify the host of freeswitch")
@@ -71,59 +65,11 @@ func main() {
 	go messageSend(ctx, conn, cancel)
 
 	err = conn.HandleEvents(ctx)
-	if errors.Is(err, net.ErrClosed) || errors.Is(err, context.Canceled) {
+	if err == nil || errors.Is(err, net.ErrClosed) || errors.Is(err, context.Canceled) {
 		goesl.Noticef("process exiting...")
 	} else {
 		goesl.Errorf("exiting with error: %v", err)
 	}
-}
-
-// just a test, it doesn't matter with fs_cli
-func (h *Handler) testApi(ctx context.Context, conn *goesl.Connection) {
-	const (
-		Caller = "1002"
-		Callee = "1001"
-	)
-	result := ""
-	check := func(res string, err error) {
-		if err != nil {
-			goesl.Errorf("api: %v", err)
-			return
-		}
-		result = res
-		fmt.Println(res)
-	}
-	check(conn.Api(ctx, "stat"))
-	check(conn.Api(ctx, "create_uuid"))
-	check(conn.BgApi(ctx, "originate", "{origination_uuid="+h.CallId+",origination_caller_id_number="+
-		Caller+"}user/"+Callee, "&echo()"))
-	h.BgJobId = result
-	goesl.Debugf("originate bg job id: %s", h.BgJobId)
-}
-
-func rawStatus2Profiles(raw string) [][]string {
-	s := bufio.NewScanner(bytes.NewBuffer([]byte(raw)))
-	start := false
-	res := make([][]string, 0)
-	for s.Scan() {
-		t := s.Text()
-		if strings.HasPrefix(t, "====") {
-			if start {
-				break
-			} else {
-				start = true
-				continue
-			}
-		}
-		if !start {
-			continue
-		}
-		t = strings.TrimSpace(t)
-		reg := regexp.MustCompile(`\s+`)
-		sli := reg.Split(t, -1)
-		res = append(res, sli)
-	}
-	return res
 }
 
 type SofiaEntry struct {
@@ -172,7 +118,7 @@ func SofiaStatus(raw []byte) (entries []*SofiaEntry) {
 func (h *Handler) OnConnect(conn *goesl.Connection) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	conn.Plain(ctx, []ev_name.EventName{ev_name.BACKGROUND_JOB, ev_name.API}, nil)
+	// conn.Plain(ctx, []ev_name.EventName{ev_name.BACKGROUND_JOB, ev_name.API}, nil)
 	conn.Fslog(ctx, goesl.FslogString2Level(*level))
 
 	die := func(s string, err error) string {
@@ -198,25 +144,7 @@ func (h *Handler) OnClose(con *goesl.Connection) {
 }
 
 func (h *Handler) OnEvent(ctx context.Context, conn *goesl.Connection, e goesl.Event) {
-	fmt.Println(e.EventContent())
-	goesl.Debugf("fire time: %s", e.FireTime().StdTime().Format("2006-01-02 15:04:05"))
-	en := e.Name()
-	app, appData := e.App()
-	goesl.Debugf("%s - event %s %s %s", e.Uuid(), en, app, appData)
-	switch en {
-	case ev_name.BACKGROUND_JOB:
-		goesl.Noticef("background job %s result: %s", e.BgJob(), e.GetTextBody())
-	// HEARTBEAT be subscribed when WithDefaultAutoRedial called
-	case ev_name.HEARTBEAT:
-		hostname, err := conn.Send(ctx, "api global_getvar", "hostname")
-		if err != nil {
-			goesl.Errorf("send global_getvar error: %v", err)
-			return
-		}
-		goesl.Noticef("receive %s of %s heartbeat", conn.Address, hostname)
-	case ev_name.API:
-		goesl.Noticef("receive api event: %s(%s)", e.Get(ev_header.API_Command), e.Get(ev_header.API_Command_Argument))
-	}
+	fmt.Print("\nRECV EVENT\n", e.EventContent())
 }
 
 var colorFormats = map[goesl.FslogLevel]string{
@@ -265,7 +193,6 @@ func send(ctx context.Context, conn *goesl.Connection, cmd string) {
 		check(conn.BgApi(ctx, cmd))
 		return
 	}
-	goesl.Debugf("send commands: %s", cmd)
 	check(conn.Api(ctx, cmd))
 }
 
@@ -298,5 +225,6 @@ func signalCatch() {
 	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
 	defer signal.Stop(sigs)
 	<-sigs
+	// need to set environment `GOTRACEBACK=1`
 	panic("show all goroutines")
 }

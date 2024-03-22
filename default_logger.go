@@ -6,20 +6,23 @@ import (
 	"io"
 	"log"
 	"os"
+	"sync"
 )
 
 var defaultLogger = &defaultLoggerType{
-	stdlog:   log.New(os.Stdout, "\033[1;34m<goesl>\033[0m ", log.LstdFlags|log.Lshortfile|log.Lmicroseconds|log.Lmsgprefix),
-	buf:      &bytes.Buffer{},
-	level:    LevelInfo,
-	terminal: true,
+	stdlog:  log.New(os.Stdout, "\033[1;34m<goesl>\033[0m ", log.LstdFlags|log.Lshortfile|log.Lmicroseconds|log.Lmsgprefix),
+	buf:     &bytes.Buffer{},
+	ctx:     &sync.Mutex{},
+	level:   LevelInfo,
+	console: true,
 }
 
 type defaultLoggerType struct {
-	stdlog   *log.Logger
-	buf      *bytes.Buffer
-	level    Level
-	terminal bool
+	stdlog  *log.Logger
+	buf     *bytes.Buffer
+	ctx     *sync.Mutex
+	level   Level
+	console bool
 }
 
 func (l *defaultLoggerType) Debugf(format string, v ...any) {
@@ -52,13 +55,13 @@ func (l *defaultLoggerType) setLevel(lv Level) {
 
 func (l *defaultLoggerType) setOutput(w io.Writer) {
 	if w != os.Stderr && w != os.Stdout {
-		l.terminal = false
+		l.console = false
 	}
 	l.stdlog.SetOutput(w)
 }
 
 func (l *defaultLoggerType) setPrefix(s string) {
-	if l.terminal {
+	if l.console {
 		l.stdlog.SetPrefix(fmt.Sprintf("\033[1;34m%s\033[0m ", s))
 	} else {
 		l.stdlog.SetPrefix(fmt.Sprintf("%s ", s))
@@ -75,7 +78,7 @@ var colorFormats = map[Level]string{
 }
 
 func (l *defaultLoggerType) colorLevelStr(lv Level) string {
-	if !l.terminal {
+	if !l.console {
 		return lv.String()
 	}
 	return fmt.Sprintf(colorFormats[lv], lv.String())
@@ -85,12 +88,19 @@ func (l *defaultLoggerType) logf(lv Level, format string, v ...any) {
 	if l.level > lv {
 		return
 	}
+	// --- protect buffer ---
+	l.ctx.Lock()
+
 	l.buf.Truncate(0)
 	l.buf.WriteString(l.colorLevelStr(lv))
 	l.buf.WriteByte(' ')
 	fmt.Fprintf(l.buf, format, v...)
 
 	l.stdlog.Output(3, l.buf.String())
+
+	l.ctx.Unlock()
+	// --- protect buffer finish ---
+
 	if lv == LevelFatal {
 		os.Exit(1)
 	}
